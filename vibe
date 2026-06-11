@@ -105,9 +105,29 @@ agent_map() {
 # Recent sessions as: recency<TAB>cwd  (empty if sessiongrep absent).
 session_rows() {
   have sessiongrep || return 0
-  sessiongrep list --limit "${VIBE_HISTORY_SCAN:-500}" 2>/dev/null | awk '
-    /^[[:space:]]+cwd=/ { if (havep){ c=$0; sub(/.*cwd=/,"",c); sub(/[[:space:]]+preview=.*/,"",c); print rtime "\t" c } havep=0; next }
-    /^[^[:space:]]/ { rtime=$0; sub(/  .*/,"",rtime); havep=1 }'
+  # Emits: recency<TAB>provider<TAB>cwd  (provider = claude/codex/cursor/…).
+  sessiongrep list --limit "${VIBE_HISTORY_SCAN:-500}" 2>/dev/null | awk -F'  +' '
+    /^[[:space:]]+cwd=/ { if (havep){ c=$0; sub(/.*cwd=/,"",c); sub(/[[:space:]]+preview=.*/,"",c); print rtime "\t" rprov "\t" c } havep=0; next }
+    /^[^[:space:]]/ { rtime=$1; rprov=$2; havep=1 }'
+}
+
+# Most-recent session provider (claude/codex/…) under <path>, via sessiongrep.
+provider_for_path() {
+  have sessiongrep || return 0
+  sessiongrep list --path "$1" --limit 1 2>/dev/null | awk -F'  +' '/^[^[:space:]]/{print $2; exit}'
+}
+
+# Resume command for an agent launch cmd (override via git config vibe.resume.<bin>).
+resume_cmd_for() {
+  local cmd="$1" bin; bin="$(basename "${cmd%% *}")"
+  local ov; ov="$(git config "vibe.resume.${bin}" 2>/dev/null || true)"
+  if [ -n "$ov" ]; then printf '%s' "$ov"; return; fi
+  case "$bin" in
+    claude) printf 'claude --continue' ;;
+    codex)  printf 'codex resume --last' ;;
+    gemini) printf 'gemini' ;;
+    *)      printf '%s' "$cmd" ;;
+  esac
 }
 state_glyph() {
   case "$1" in
@@ -194,22 +214,24 @@ cmd_code() {
   [ -z "$name" ] && name="$(slug_from_prompt "$prompt")"
   agent="${agent:-$(cfg vibe.agent VIBE_AGENT claude)}"
   create_worktree "$name" "$from"
+  # Record the agent so `chat` knows what to restore later.
+  git -C "$(main_root)" config "branch.${NEW_BRANCH}.vibeAgent" "$agent" 2>/dev/null || true
   echo "Starting agent: ${agent} \"${prompt}\""
   herdr agent start "$name" --cwd "$NEW_PATH" --no-focus -- ${agent} "$prompt" >/dev/null 2>&1 \
     || die "herdr agent start failed — is the server running? ('herdr status')"
   cat <<EOF
 
 Vibe '$name' is running (branch $NEW_BRANCH).
-  go to it: ${PROG} cd $name        (attaches to the agent)
-  board:    ${PROG} ls
-  finish:   ${PROG} finish $name
+  chat:    ${PROG} chat $name        (attach to the agent)
+  board:   ${PROG} ls
+  finish:  ${PROG} finish $name
 EOF
 }
 
 # The board: worktrees × agent state × PR × session history.
 cmd_ls() {
   local root; root="$(main_root)" || die "not inside a git repo"
-  local -a WP=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=()
+  local -a WP=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
   local path="" branch=""
   while IFS= read -r line; do
     case "$line" in
@@ -217,7 +239,7 @@ cmd_ls() {
       branch\ *)
         branch="${line#branch refs/heads/}"
         WP+=("$path"); WB+=("$branch"); WN+=("$(basename "$path")")
-        WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=("")
+        WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=(""); WPROV+=("")
         ;;
     esac
   done < <(git -C "$root" worktree list --porcelain)
@@ -229,28 +251,37 @@ cmd_ls() {
     done
     printf '%s' "$best"
   }
-  local lc idx st cwd t c
+  local lc idx st cwd t prov c
   while IFS=$'\t' read -r st cwd; do
     [ -n "$cwd" ] || continue
     lc="$(printf '%s' "$cwd" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
     [ "$idx" -ge 0 ] && [ -z "${WSTATE[$idx]}" ] && WSTATE[$idx]="$st"
   done < <(agent_map)
-  while IFS=$'\t' read -r t c; do
+  while IFS=$'\t' read -r t prov c; do
     [ -n "$c" ] || continue
     lc="$(printf '%s' "$c" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
-    if [ "$idx" -ge 0 ]; then WCNT[$idx]=$(( WCNT[idx] + 1 )); [ -z "${WFIRST[$idx]}" ] && WFIRST[$idx]="$t"; fi
+    if [ "$idx" -ge 0 ]; then
+      WCNT[$idx]=$(( WCNT[idx] + 1 ))
+      [ -z "${WFIRST[$idx]}" ] && WFIRST[$idx]="$t"
+      [ -z "${WPROV[$idx]}" ] && WPROV[$idx]="$prov"
+    fi
   done < <(session_rows)
 
-  printf '%-28s %-34s %-12s %-12s %s\n' "VIBE" "BRANCH" "AGENT" "PR" "HISTORY"
-  local i pr hist
+  printf '%-26s %-30s %-9s %-11s %-11s %s\n' "VIBE" "BRANCH" "MODEL" "STATE" "PR" "HISTORY"
+  local i pr hist model
   for i in "${!WP[@]}"; do
     pr="-"
     if have gh; then
       pr="$(gh pr list --head "${WB[$i]}" --state all --json number,state -q '.[0] | if .==null then "-" else "#\(.number) \(.state)" end' 2>/dev/null || echo '-')"
       [ -z "$pr" ] && pr="-"
     fi
+    # MODEL: the agent recorded at code-time (basename), else the most-recent session provider.
+    model="$(git -C "$root" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
+    model="$(basename "${model%% *}" 2>/dev/null)"
+    [ -z "$model" ] && model="${WPROV[$i]}"
+    [ -z "$model" ] && model="–"
     if [ "${WCNT[$i]}" -gt 0 ]; then hist="${WCNT[$i]} · ${WFIRST[$i]}"; else hist="–"; fi
-    printf '%-28s %-34s %-12s %-12s %s\n' "${WN[$i]}" "${WB[$i]}" "$(state_glyph "${WSTATE[$i]}")" "$pr" "$hist"
+    printf '%-26s %-30s %-9s %-11s %-11s %s\n' "${WN[$i]}" "${WB[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$pr" "$hist"
   done
 }
 
@@ -272,19 +303,39 @@ _open_worktree() {
   else printf '%s\n' "$path"; fi
 }
 
-# cd: go to the vibe — attach to its agent if one is running, else open a dev shell.
-cmd_cd() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} cd <name|branch>"
-  local path; path="$(resolve_worktree "$name")"
+# chat: talk to the vibe's agent — attach if it's running, else restore (resume) it.
+cmd_chat() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} chat <name|branch>"
+  have herdr || die "herdr not found — needed to run/attach agents (https://herdr.dev)"
+  local root path; root="$(main_root)" || die "not inside a git repo"
+  path="$(resolve_worktree "$name")"
   [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
-  if [ -t 1 ]; then
-    local agent; agent="$(agent_for_path "$path")"
-    if [ -n "$agent" ]; then echo "Attaching to agent '$agent' (detach to leave)..."; exec herdr agent attach "$agent"; fi
+
+  # 1) already running → attach
+  local agent; agent="$(agent_for_path "$path")"
+  if [ -n "$agent" ]; then
+    [ -t 1 ] || { echo "agent '$agent' is running in $path"; return 0; }
+    echo "Attaching to agent '$agent' (detach to leave)..."; exec herdr agent attach "$agent"
   fi
-  _open_worktree "$path"
+
+  # 2) not running → restore: relaunch the recorded agent (resume), re-establishing env
+  local wtname branch base acmd resume
+  wtname="$(basename "$path")"
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
+  acmd="$(git -C "$root" config "branch.${branch}.vibeAgent" 2>/dev/null || true)"
+  [ -z "$acmd" ] && acmd="$(provider_for_path "$path")"
+  [ -z "$acmd" ] && acmd="$(cfg vibe.agent VIBE_AGENT claude)"
+  resume="$(resume_cmd_for "$acmd")"
+  echo "Restoring agent in $path: ${resume}"
+  run_hook vibe_setup "$path" "$base" "$branch" >/dev/null 2>&1 || true
+  herdr agent start "$wtname" --cwd "$path" --no-focus -- ${resume} >/dev/null 2>&1 \
+    || die "herdr agent start failed — 'herdr status'?"
+  [ -t 1 ] || { echo "Restored agent '$wtname'."; return 0; }
+  exec herdr agent attach "$wtname"
 }
 
-# shell: always open a plain dev shell in the worktree (ignore any running agent).
+# shell / cd: open a plain dev shell in the worktree (or print the path when not a TTY).
 cmd_shell() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} shell <name|branch>"
   local path; path="$(resolve_worktree "$name")"
@@ -402,9 +453,9 @@ Usage: ${PROG} <command> [args]
   new <name> [--from b] [--no-cd]   Create a worktree + branch wt/<base>/<name>, open a shell
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
-  ls            (alias: board)      The board: worktrees × agent state × PR × session history
-  cd <name>     (alias: attach)     Go to the vibe: attach to its agent, else a dev shell
-  shell <name>                      Open a plain dev shell in a worktree (ignore its agent)
+  ls            (alias: board)      The board: worktrees × model × agent state × PR × history
+  chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
+  shell <name>  (alias: cd)         Open a plain dev shell in a worktree
   recall <name> [args]              Session history scoped to a worktree (sessiongrep)
   pull <ref>                        Merge another feature into the current branch
   finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
@@ -428,8 +479,8 @@ main() {
     new) cmd_new "$@" ;;
     code) cmd_code "$@" ;;
     ls|list|board) cmd_ls "$@" ;;
-    cd|attach) cmd_cd "$@" ;;
-    shell) cmd_shell "$@" ;;
+    chat|attach) cmd_chat "$@" ;;
+    shell|cd) cmd_shell "$@" ;;
     recall) cmd_recall "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;
