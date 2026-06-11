@@ -16,7 +16,9 @@
 #   vibe.remote  / VIBE_REMOTE     remote name           (default "origin")
 set -euo pipefail
 
-PROG="$(basename "$0")"
+# VIBE_PROG lets a wrapper (e.g. the Nix package) set the displayed name, since a
+# shebang script's $0 is the (wrapped) file path, not the invoked command name.
+PROG="${VIBE_PROG:-$(basename "$0")}"
 
 # ---- helpers ---------------------------------------------------------------
 

@@ -23,7 +23,7 @@
             # Guarantee the basics exist, but as a PATH *suffix* so the user's own
             # git/gh/docker/nix/$SHELL still take precedence (vibe drives the ambient env).
             wrapProgram "$out/bin/vibe" \
-              --argv0 vibe \
+              --set-default VIBE_PROG vibe \
               --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.coreutils pkgs.gnused ]}
             runHook postInstall
           '';
