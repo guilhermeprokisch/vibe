@@ -3,7 +3,7 @@
 #
 # A vibe is an isolated git worktree per feature (branch namespaced by the base it forked
 # from). Core lifecycle is git-only: new / ls / cd / pull / finish. On top of that, an
-# optional agent layer (code / attach / recall and the live `ls` board) integrates with
+# optional agent layer (code / chat and the live `ls` board) integrates with
 #   herdr        (https://herdr.dev)   — run/observe agents in panes
 #   sessiongrep                        — past agent session history
 # Each is used only when its command is invoked, and degrades gracefully if absent.
@@ -345,16 +345,6 @@ cmd_shell() {
   _open_worktree "$path"
 }
 
-cmd_recall() {
-  local name="${1:-}"; shift || true
-  [ -n "$name" ] || die "usage: ${PROG} recall <name|branch> [sessiongrep args]"
-  have sessiongrep || die "sessiongrep not found"
-  local path; path="$(resolve_worktree "$name")"
-  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
-  echo "Sessions under $path:"
-  sessiongrep list --path "$path" "$@"
-}
-
 cmd_pull() {
   local arg="${1:-}"; [ -n "$arg" ] || die "usage: ${PROG} pull <branch|worktree>"
   local cur ref root rem; root="$(main_root)"; rem="$(remote)"
@@ -458,14 +448,13 @@ Usage: ${PROG} <command> [args]
   ls            (alias: board)      The board: worktrees × model × agent state × PR × history
   chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
   shell <name>  (alias: cd)         Open a plain dev shell in a worktree
-  recall <name> [args]              Session history scoped to a worktree (sessiongrep)
   pull <ref>                        Merge another feature into the current branch
   finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
                                     worktree, fast-forward the base (opts: --no-merge,
                                     --base b, --force). No <name> = the current worktree.
 
 Core (new/ls/cd/pull/finish) needs only git (+ gh for finish). The agent layer
-(code/attach/recall and the live ls columns) uses herdr / sessiongrep / jq when present.
+(code/chat and the live ls columns) uses herdr / sessiongrep / jq when present.
 
 Config (git config or env): vibe.dir/VIBE_DIR, vibe.prefix/VIBE_PREFIX,
   vibe.shell/VIBE_SHELL_CMD, vibe.remote/VIBE_REMOTE, vibe.agent/VIBE_AGENT (default claude),
@@ -483,7 +472,6 @@ main() {
     ls|list|board) cmd_ls "$@" ;;
     chat|attach) cmd_chat "$@" ;;
     shell|cd) cmd_shell "$@" ;;
-    recall) cmd_recall "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;
     ""|-h|--help|help) usage ;;

@@ -9,7 +9,7 @@ branch locally so nothing needs a manual `git pull`. One feature, one vibe.
 
 The **core** lifecycle (`new` / `ls` / `cd` / `pull` / `finish`) needs only `git`
 (+ [`gh`](https://cli.github.com) for `finish`). An **optional agent layer**
-(`code` / `attach` / `recall` and the live `ls` board) integrates, when present, with:
+(`code` / `chat` and the live `ls` board) integrates, when present, with:
 
 - [**herdr**](https://herdr.dev) — run & observe agents in panes
 - **sessiongrep** — past agent session history
@@ -29,18 +29,17 @@ Or with Nix — the flake exposes `packages.<system>.vibe`.
 ```bash
 # core (git only)
 vibe new feature-a [--from main]   # worktree + branch vibe/<base>/feature-a, opens a shell
-vibe cd feature-a                  # open a shell in a worktree (exact or substring)
+vibe shell feature-a   (alias: cd) # open a plain dev shell in a worktree
 vibe pull other-feature            # merge another feature into the current branch
 vibe finish [feature-a]            # PR (created if missing) → conflict-check → squash-merge
                                    #   → remove worktree → fast-forward base. No name = cwd.
 vibe finish --no-merge / --base b / --force
 
-# agent layer (needs herdr; history needs sessiongrep)
+# agent layer (needs herdr)
 vibe code "add WhatsApp opt-out"   # worktree + start an agent on the prompt
    [--name x] [--from b] [--agent cmd]
-vibe ls            (alias: board)  # worktrees × live agent state × PR × session history
-vibe attach feature-a              # jump into the agent's pane
-vibe recall feature-a [--since 1d] # session history scoped to a worktree
+vibe ls            (alias: board)  # worktrees × model × live agent state × PR × history
+vibe chat feature-a  (alias: attach) # attach to the agent, or resume it if stopped
 ```
 
 ### The board
