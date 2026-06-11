@@ -39,6 +39,7 @@ vibe finish --no-merge / --base b / --force
 vibe code "add WhatsApp opt-out"   # worktree + start an agent on the prompt
    [--name x] [--from b] [--agent cmd]
 vibe ls            (alias: board)  # each vibe with its agent model, live state, history
+vibe ls --all                      # every project (PROJECT column): registry + live agents
 vibe chat feature-a  (alias: attach) # attach to the agent, or resume it if stopped
 ```
 

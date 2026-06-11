@@ -51,6 +51,25 @@ run_hook() { # run_hook <fn> <worktree> <base> <branch> [name]
 
 remote() { cfg vibe.remote VIBE_REMOTE origin; }
 
+# Registry of repos vibe has touched (for `ls --all`). Auto-populated on every run.
+registry_file() { printf '%s/vibe/projects' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+register_project() {
+  local root="${1:-}" f; [ -n "$root" ] || return 0; f="$(registry_file)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  grep -qxF "$root" "$f" 2>/dev/null || printf '%s\n' "$root" >> "$f"
+}
+# All repos for --all: registry (existing dirs) + repos with a live herdr agent, deduped.
+all_repos() {
+  local f; f="$(registry_file)"
+  {
+    [ -f "$f" ] && cat "$f"
+    if have herdr && have jq; then
+      herdr agent list 2>/dev/null | jq -r '.result.agents[]?.cwd // empty' 2>/dev/null \
+        | while IFS= read -r c; do [ -d "$c" ] && ( cd "$c" 2>/dev/null && main_root ); done
+    fi
+  } | while IFS= read -r r; do [ -n "$r" ] && [ -d "$r" ] && printf '%s\n' "$r"; done | awk '!seen[$0]++'
+}
+
 main_root() {
   local g; g="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
   case "$g" in /*) : ;; *) g="$(pwd)/$g" ;; esac
@@ -230,23 +249,33 @@ Vibe '$name' is running (branch $NEW_BRANCH).
 EOF
 }
 
-# The board: worktrees × agent model × state × session history.
+# The board: each vibe with its agent model, state, session history.
+# `--all` (-a) spans every project (registry + herdr-active repos), with a PROJECT column.
 cmd_ls() {
-  local root; root="$(main_root)" || die "not inside a git repo"
-  local -a WP=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
-  local path="" branch=""
-  while IFS= read -r line; do
-    case "$line" in
-      worktree\ *) path="${line#worktree }" ;;
-      branch\ *)
-        branch="${line#branch refs/heads/}"
-        WP+=("$path"); WB+=("$branch"); WN+=("$(basename "$path")")
-        WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=(""); WPROV+=("")
-        ;;
-    esac
-  done < <(git -C "$root" worktree list --porcelain)
+  local all="false"
+  case "${1:-}" in --all|-a) all="true" ;; "" ) : ;; *) die "unknown option for ls: $1" ;; esac
+  local -a WR=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
 
-  _wt_index() { # arg: lowercased cwd with trailing slash → longest-matching worktree index or -1
+  _collect() { # _collect <repo>: append that repo's worktrees to the arrays
+    local repo="$1" path="" branch=""
+    while IFS= read -r line; do
+      case "$line" in
+        worktree\ *) path="${line#worktree }" ;;
+        branch\ *)
+          branch="${line#branch refs/heads/}"
+          WR+=("$repo"); WB+=("$branch"); WN+=("$(basename "$path")")
+          WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=(""); WPROV+=("")
+          ;;
+      esac
+    done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+  }
+  if [ "$all" = "true" ]; then
+    local r; while IFS= read -r r; do _collect "$r"; done < <(all_repos)
+  else
+    _collect "$(main_root)" || die "not inside a git repo"
+  fi
+
+  _wt_index() {
     local clc="$1" i best=-1 bestlen=0
     for i in "${!WL[@]}"; do
       case "$clc" in "${WL[$i]}"/*) if [ "${#WL[$i]}" -gt "$bestlen" ]; then bestlen="${#WL[$i]}"; best="$i"; fi ;; esac
@@ -269,16 +298,21 @@ cmd_ls() {
     fi
   done < <(session_rows)
 
-  printf '%-30s %-10s %-12s %s\n' "VIBE" "MODEL" "STATE" "HISTORY"
   local i hist model
-  for i in "${!WP[@]}"; do
-    # MODEL: the agent recorded at code-time (basename), else the most-recent session provider.
-    model="$(git -C "$root" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
+  if [ "$all" = "true" ]; then printf '%-20s %-26s %-10s %-12s %s\n' "PROJECT" "VIBE" "MODEL" "STATE" "HISTORY"
+  else printf '%-30s %-10s %-12s %s\n' "VIBE" "MODEL" "STATE" "HISTORY"; fi
+  for i in "${!WR[@]}"; do
+    # MODEL: agent recorded at code-time (in that repo's config), else session provider.
+    model="$(git -C "${WR[$i]}" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
     model="$(basename "${model%% *}" 2>/dev/null)"
     [ -z "$model" ] && model="${WPROV[$i]}"
     [ -z "$model" ] && model="–"
     if [ "${WCNT[$i]}" -gt 0 ]; then hist="${WCNT[$i]} · ${WFIRST[$i]}"; else hist="–"; fi
-    printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
+    if [ "$all" = "true" ]; then
+      printf '%-20s %-26s %-10s %-12s %s\n' "$(basename "${WR[$i]}")" "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
+    else
+      printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
+    fi
   done
 }
 
@@ -481,7 +515,9 @@ Usage: ${PROG} <command> [args]
   new <name> [--from b] [--no-cd]   Create a worktree + branch vibe/<base>/<name>, open a shell
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
-  ls            (alias: board)      The board: each vibe with its agent model, state, history
+  ls [--all|-a]  (alias: board)     The board: each vibe with its agent model, state, history.
+                                    --all spans every project (PROJECT column) — registry of
+                                    repos vibe has touched, plus any repo with a live agent.
   chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
   shell <name>  (alias: cd)         Open a plain dev shell in a worktree
   pull <ref>                        Merge another feature into the current branch
@@ -504,6 +540,7 @@ EOF
 main() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
   load_project_config
+  register_project "$(main_root 2>/dev/null)"   # remember this repo for `ls --all`
   local sub="${1:-}"; shift || true
   case "$sub" in
     new) cmd_new "$@" ;;
