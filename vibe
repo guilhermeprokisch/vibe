@@ -10,7 +10,7 @@
 #
 # Config (git config keys, overridable by env):
 #   vibe.dir    / VIBE_DIR        worktrees parent dir (default ../<repo>-wt)
-#   vibe.prefix / VIBE_PREFIX     branch namespace      (default "wt")
+#   vibe.prefix / VIBE_PREFIX     branch namespace      (default "vibe")
 #   vibe.shell  / VIBE_SHELL_CMD  command to open in a worktree (default: auto)
 #   vibe.remote / VIBE_REMOTE     remote name           (default "origin")
 #   vibe.agent  / VIBE_AGENT      agent command for `code` (default "claude")
@@ -160,7 +160,9 @@ create_worktree() {
   if [ -z "$base" ]; then base="$(current_branch)"; [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"; fi
   local root rem prefix slug branch wtdir path start
   root="$(main_root)" || die "not inside a git repo"
-  rem="$(remote)"; prefix="$(cfg vibe.prefix VIBE_PREFIX wt)"; slug="$(slugify "$name")"
+  rem="$(remote)"; prefix="$(cfg vibe.prefix VIBE_PREFIX vibe)"; slug="$(slugify "$name")"
+  # Namespaced branch <prefix>/<base>/<name> records its origin; the prefix prevents a
+  # git D/F conflict (a ref can't nest under an existing branch). Base slashes flattened.
   branch="${prefix}/${base//\//-}/${name}"
   wtdir="$(worktrees_dir)"; path="${wtdir}/${slug}"
   [ -e "$path" ] && die "path already exists: $path"
@@ -450,7 +452,7 @@ ${PROG} — parallel feature worktrees (with optional agent orchestration) for a
 
 Usage: ${PROG} <command> [args]
 
-  new <name> [--from b] [--no-cd]   Create a worktree + branch wt/<base>/<name>, open a shell
+  new <name> [--from b] [--no-cd]   Create a worktree + branch vibe/<base>/<name>, open a shell
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
   ls            (alias: board)      The board: worktrees × model × agent state × PR × history

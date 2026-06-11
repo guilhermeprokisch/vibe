@@ -28,7 +28,7 @@ Or with Nix — the flake exposes `packages.<system>.vibe`.
 
 ```bash
 # core (git only)
-vibe new feature-a [--from main]   # worktree + branch wt/<base>/feature-a, opens a shell
+vibe new feature-a [--from main]   # worktree + branch vibe/<base>/feature-a, opens a shell
 vibe cd feature-a                  # open a shell in a worktree (exact or substring)
 vibe pull other-feature            # merge another feature into the current branch
 vibe finish [feature-a]            # PR (created if missing) → conflict-check → squash-merge
@@ -47,9 +47,9 @@ vibe recall feature-a [--since 1d] # session history scoped to a worktree
 
 ```
 VIBE                BRANCH               AGENT      PR          HISTORY
-auth-fix            wt/main/auth-fix     ● working  –           2 · 18m ago
-export-pdf          wt/main/export-pdf   ◍ blocked  #41 open    1 · 3h ago
-billing             wt/main/billing      ✓ done     #39 open    4
+auth-fix            vibe/main/auth-fix   ● working  –           2 · 18m ago
+export-pdf          vibe/main/export-pdf ◍ blocked  #41 open    1 · 3h ago
+billing             vibe/main/billing    ✓ done     #39 open    4
 ```
 
 `AGENT` ← herdr `agent_status` (matched to a worktree by cwd) · `PR` ← gh ·
@@ -60,7 +60,7 @@ case-insensitive). Each column degrades to `–` if its tool/server isn't availa
 
 - **Worktrees** are created as siblings under `../<repo>-wt/<name>` (override with
   `vibe.dir`). The directory keeps the short feature name.
-- **Branches** are namespaced `wt/<base>/<feature>` (override the `wt` prefix with
+- **Branches** are namespaced `vibe/<base>/<feature>` (override the `vibe` prefix with
   `vibe.prefix`) so each branch records the base it forked from. The literal
   `<base>/<feature>` can't exist in git (a ref can't nest under an existing branch), hence
   the prefix; base slashes are flattened to dashes.
