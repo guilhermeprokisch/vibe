@@ -119,14 +119,14 @@ resolve_worktree() {
 agent_map() {
   have herdr && have jq || return 0
   herdr agent list 2>/dev/null \
-    | jq -r '.result.agents[]? | [(.agent_status // .status // "unknown"), (.cwd // .foreground_cwd // "")] | @tsv' 2>/dev/null || true
+    | jq -r '.result.agents[]? | [(.agent_status // .status // "unknown"), ((.cwd // .foreground_cwd // "")|ascii_downcase)] | @tsv' 2>/dev/null || true
 }
 # Recent sessions as: recency<TAB>cwd  (empty if sessiongrep absent).
 session_rows() {
   have sessiongrep || return 0
   # Emits: recency<TAB>provider<TAB>cwd  (provider = claude/codex/cursor/…).
   sessiongrep list --limit "${VIBE_HISTORY_SCAN:-500}" 2>/dev/null | awk -F'  +' '
-    /^[[:space:]]+cwd=/ { if (havep){ c=$0; sub(/.*cwd=/,"",c); sub(/[[:space:]]+preview=.*/,"",c); print rtime "\t" rprov "\t" c } havep=0; next }
+    /^[[:space:]]+cwd=/ { if (havep){ c=$0; sub(/.*cwd=/,"",c); sub(/[[:space:]]+preview=.*/,"",c); print rtime "\t" rprov "\t" tolower(c) } havep=0; next }
     /^[^[:space:]]/ { rtime=$1; rprov=$2; havep=1 }'
 }
 
@@ -252,8 +252,18 @@ EOF
 # The board: each vibe with its agent model, state, session history.
 # `--all` (-a) spans every project (registry + herdr-active repos), with a PROJECT column.
 cmd_ls() {
-  local all="false"
-  case "${1:-}" in --all|-a) all="true" ;; "" ) : ;; *) die "unknown option for ls: $1" ;; esac
+  local all="false" watch="false" interval="2"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all|-a) all="true" ;;
+      --watch|-w) watch="true" ;;
+      --interval|-n) interval="${2:?-n needs seconds}"; shift ;;
+      --interval=*) interval="${1#*=}" ;;
+      *) die "unknown option for ls: $1" ;;
+    esac; shift
+  done
+
+  _board() {
   local -a WR=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
 
   _collect() { # _collect <repo>: append that repo's worktrees to the arrays
@@ -275,26 +285,29 @@ cmd_ls() {
     _collect "$(main_root)" || die "not inside a git repo"
   fi
 
+  # Longest-matching worktree index for a (already-lowercased, slash-suffixed) cwd → RIDX.
+  # Sets a variable instead of echoing, to avoid a subshell fork per row.
+  local RIDX
   _wt_index() {
-    local clc="$1" i best=-1 bestlen=0
+    local clc="$1" i bestlen=0; RIDX=-1
     for i in "${!WL[@]}"; do
-      case "$clc" in "${WL[$i]}"/*) if [ "${#WL[$i]}" -gt "$bestlen" ]; then bestlen="${#WL[$i]}"; best="$i"; fi ;; esac
+      case "$clc" in "${WL[$i]}"/*) if [ "${#WL[$i]}" -gt "$bestlen" ]; then bestlen="${#WL[$i]}"; RIDX="$i"; fi ;; esac
     done
-    printf '%s' "$best"
   }
-  local lc idx st cwd t prov c
+  # cwds from agent_map / session_rows are already lowercased (jq/awk), so no per-row fork.
+  local st cwd t prov c
   while IFS=$'\t' read -r st cwd; do
     [ -n "$cwd" ] || continue
-    lc="$(printf '%s' "$cwd" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
-    [ "$idx" -ge 0 ] && [ -z "${WSTATE[$idx]}" ] && WSTATE[$idx]="$st"
+    _wt_index "${cwd}/"
+    [ "$RIDX" -ge 0 ] && [ -z "${WSTATE[$RIDX]}" ] && WSTATE[$RIDX]="$st"
   done < <(agent_map)
   while IFS=$'\t' read -r t prov c; do
     [ -n "$c" ] || continue
-    lc="$(printf '%s' "$c" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
-    if [ "$idx" -ge 0 ]; then
-      WCNT[$idx]=$(( WCNT[idx] + 1 ))
-      [ -z "${WFIRST[$idx]}" ] && WFIRST[$idx]="$t"
-      [ -z "${WPROV[$idx]}" ] && WPROV[$idx]="$prov"
+    _wt_index "${c}/"
+    if [ "$RIDX" -ge 0 ]; then
+      WCNT[$RIDX]=$(( WCNT[RIDX] + 1 ))
+      [ -z "${WFIRST[$RIDX]}" ] && WFIRST[$RIDX]="$t"
+      [ -z "${WPROV[$RIDX]}" ] && WPROV[$RIDX]="$prov"
     fi
   done < <(session_rows)
 
@@ -314,6 +327,21 @@ cmd_ls() {
       printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
     fi
   done
+  }  # end _board
+
+  if [ "$watch" = "true" ]; then
+    have tput && tput civis 2>/dev/null || true
+    trap 'have tput && tput cnorm 2>/dev/null; echo; exit 0' INT TERM
+    while :; do
+      printf '\033[H\033[2J'
+      printf 'vibe board — %s  (every %ss · Ctrl-C to stop)\n\n' "$(date +%H:%M:%S)" "$interval"
+      _board
+      sleep "$interval" || break
+    done
+    have tput && tput cnorm 2>/dev/null || true
+  else
+    _board
+  fi
 }
 
 # herdr agent NAME running in <worktree-path> (empty if none / herdr absent).
@@ -515,9 +543,11 @@ Usage: ${PROG} <command> [args]
   new <name> [--from b] [--no-cd]   Create a worktree + branch vibe/<base>/<name>, open a shell
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
-  ls [--all|-a]  (alias: board)     The board: each vibe with its agent model, state, history.
+  ls [--all|-a] [--watch|-w [-n S]]  (alias: board)
+                                    The board: each vibe with its agent model, state, history.
                                     --all spans every project (PROJECT column) — registry of
                                     repos vibe has touched, plus any repo with a live agent.
+                                    --watch redraws every S seconds (default 2) for live state.
   chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
   shell <name>  (alias: cd)         Open a plain dev shell in a worktree
   pull <ref>                        Merge another feature into the current branch
