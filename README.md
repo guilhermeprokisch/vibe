@@ -1,34 +1,60 @@
 # vibe
 
-Parallel feature worktrees for any git repo. Spin up an isolated workspace per feature
-(its own git worktree, on a branch namespaced by the base it forked from), hack on it,
-then `finish` it (PR → conflict-check → squash-merge) and clean up — fast-forwarding the
-base branch locally so nothing needs a manual `git pull`. One feature, one vibe.
+Parallel feature worktrees — with optional agent orchestration — for any git repo.
 
-Generic over any git project. No assumptions about ports, Docker, or a build system —
-the dev shell auto-detects a Nix flake (`nix develop`), otherwise opens your `$SHELL`.
-Uses [`gh`](https://cli.github.com) for PR create/merge (only in `finish`).
+Spin up an isolated workspace per feature (its own git worktree, on a branch namespaced by
+the base it forked from), hack on it (yourself, or hand it to a coding agent), then
+`finish` it (PR → conflict-check → squash-merge) and clean up — fast-forwarding the base
+branch locally so nothing needs a manual `git pull`. One feature, one vibe.
+
+The **core** lifecycle (`new` / `ls` / `cd` / `pull` / `finish`) needs only `git`
+(+ [`gh`](https://cli.github.com) for `finish`). An **optional agent layer**
+(`code` / `attach` / `recall` and the live `ls` board) integrates, when present, with:
+
+- [**herdr**](https://herdr.dev) — run & observe agents in panes
+- **sessiongrep** — past agent session history
+
+The dev shell auto-detects a Nix flake (`nix develop`), otherwise opens your `$SHELL`.
 
 ## Install
 
 ```bash
-# put it on PATH (the name is just the filename — rename freely)
-install -m 0755 vibe ~/bin/vibe        # or /usr/local/bin
+install -m 0755 vibe ~/bin/vibe        # or /usr/local/bin (name is just the filename)
 ```
+
+Or with Nix — the flake exposes `packages.<system>.vibe`.
 
 ## Use
 
 ```bash
-vibe new feature-a           # worktree + branch wt/<current-branch>/feature-a, opens a shell
-vibe new feature-a --from main
-vibe ls                      # worktrees + branch + PR state
-vibe cd feature-a            # open a shell in a worktree (exact or substring match)
-vibe pull other-feature      # merge another feature into the current branch
-vibe finish                  # PR (created if missing) → conflict-check → squash-merge →
-                             # remove worktree → fast-forward the base locally
-vibe finish --base main      # override the merge base
-vibe finish --no-merge       # just stop + remove (no PR merge)
+# core (git only)
+vibe new feature-a [--from main]   # worktree + branch wt/<base>/feature-a, opens a shell
+vibe cd feature-a                  # open a shell in a worktree (exact or substring)
+vibe pull other-feature            # merge another feature into the current branch
+vibe finish [feature-a]            # PR (created if missing) → conflict-check → squash-merge
+                                   #   → remove worktree → fast-forward base. No name = cwd.
+vibe finish --no-merge / --base b / --force
+
+# agent layer (needs herdr; history needs sessiongrep)
+vibe code "add WhatsApp opt-out"   # worktree + start an agent on the prompt
+   [--name x] [--from b] [--agent cmd]
+vibe ls            (alias: board)  # worktrees × live agent state × PR × session history
+vibe attach feature-a              # jump into the agent's pane
+vibe recall feature-a [--since 1d] # session history scoped to a worktree
 ```
+
+### The board
+
+```
+VIBE                BRANCH               AGENT      PR          HISTORY
+auth-fix            wt/main/auth-fix     ● working  –           2 · 18m ago
+export-pdf          wt/main/export-pdf   ◍ blocked  #41 open    1 · 3h ago
+billing             wt/main/billing      ✓ done     #39 open    4
+```
+
+`AGENT` ← herdr `agent_status` (matched to a worktree by cwd) · `PR` ← gh ·
+`HISTORY` ← sessiongrep (one scan, bucketed to the longest matching worktree path,
+case-insensitive). Each column degrades to `–` if its tool/server isn't available.
 
 ### How it works
 

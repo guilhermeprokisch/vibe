@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# vibe — parallel feature worktrees for any git project.
+# vibe — parallel feature worktrees (with optional agent orchestration) for any git repo.
 #
-# A vibe is your collection of git worktrees: spin up an isolated workspace per
-# feature (branch namespaced by the base it forked from), hack on it, then finish it
-# (PR + conflict-check + squash-merge) and clean up — fast-forwarding the base locally
-# so nothing needs a manual pull.
-#
-# Generic over any git repo. Uses `gh` for PR create/merge (only in `finish`).
-# No assumptions about ports, Docker, or Nix — the dev shell auto-detects a flake.
+# A vibe is an isolated git worktree per feature (branch namespaced by the base it forked
+# from). Core lifecycle is git-only: new / ls / cd / pull / finish. On top of that, an
+# optional agent layer (code / attach / recall and the live `ls` board) integrates with
+#   herdr        (https://herdr.dev)   — run/observe agents in panes
+#   sessiongrep                        — past agent session history
+# Each is used only when its command is invoked, and degrades gracefully if absent.
 #
 # Config (git config keys, overridable by env):
-#   vibe.dir     / VIBE_DIR        worktrees parent dir (default ../<repo>-wt)
-#   vibe.prefix  / VIBE_PREFIX     branch namespace      (default "wt")
-#   vibe.shell   / VIBE_SHELL_CMD  command to open in a worktree (default: auto)
-#   vibe.remote  / VIBE_REMOTE     remote name           (default "origin")
+#   vibe.dir    / VIBE_DIR        worktrees parent dir (default ../<repo>-wt)
+#   vibe.prefix / VIBE_PREFIX     branch namespace      (default "wt")
+#   vibe.shell  / VIBE_SHELL_CMD  command to open in a worktree (default: auto)
+#   vibe.remote / VIBE_REMOTE     remote name           (default "origin")
+#   vibe.agent  / VIBE_AGENT      agent command for `code` (default "claude")
 set -euo pipefail
 
 # VIBE_PROG lets a wrapper (e.g. the Nix package) set the displayed name, since a
@@ -22,27 +22,27 @@ PROG="${VIBE_PROG:-$(basename "$0")}"
 
 # ---- helpers ---------------------------------------------------------------
 
-die() { echo "${PROG}: $*" >&2; exit 1; }
+die()  { echo "${PROG}: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 cfg() { # cfg <git-config-key> <var-name> <default>
   local v
   v="$(git config "$1" 2>/dev/null || true)"
-  # Fall back to the named variable (env, or set by a sourced .vibe.sh), then default.
   [ -z "$v" ] && [ -n "${2:-}" ] && v="${!2-}"
   [ -z "$v" ] && v="$3"
   printf '%s' "$v"
 }
 
-# Source a committed per-project .vibe.sh (repo root) if present: it can set VIBE_*
-# defaults and define hook functions (vibe_setup / vibe_teardown).
+# Source a committed per-project .vibe.sh (repo root): sets VIBE_* defaults and hooks
+# (vibe_setup / vibe_teardown).
 load_project_config() {
   local f; f="$(main_root 2>/dev/null)/.vibe.sh"
   [ -f "$f" ] && . "$f"
   return 0
 }
 
-# Run a hook function (if defined) with VIBE_WORKTREE/VIBE_BASE/VIBE_BRANCH/VIBE_NAME
-# exported; anything the hook exports propagates into the shell vibe then opens.
+# Run a hook (if defined) with VIBE_WORKTREE/VIBE_BASE/VIBE_BRANCH/VIBE_NAME exported;
+# anything it exports propagates into the shell/agent vibe then launches.
 run_hook() { # run_hook <fn> <worktree> <base> <branch> [name]
   declare -F "$1" >/dev/null 2>&1 || return 0
   export VIBE_WORKTREE="$2" VIBE_BASE="$3" VIBE_BRANCH="$4" VIBE_NAME="${5:-$(basename "$2")}"
@@ -51,34 +51,30 @@ run_hook() { # run_hook <fn> <worktree> <base> <branch> [name]
 
 remote() { cfg vibe.remote VIBE_REMOTE origin; }
 
-# Absolute path of the repo's main working tree (parent of the shared .git dir).
 main_root() {
-  local g
-  g="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  local g; g="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
   case "$g" in /*) : ;; *) g="$(pwd)/$g" ;; esac
   (cd "$(dirname "$g")" && pwd -P)
 }
-
 repo_name() { basename "$(main_root)"; }
-
 worktrees_dir() {
   local d; d="$(cfg vibe.dir VIBE_DIR "")"
   if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s/%s-wt' "$(dirname "$(main_root)")" "$(repo_name)"; fi
 }
-
 slugify() {
   local s; s="$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
   [ -z "$s" ] && s="wt"; printf '%s' "$s"
 }
-
+slug_from_prompt() {
+  local s; s="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32 | sed 's/-*$//')"
+  [ -n "$s" ] && printf '%s' "$s" || printf 'vibe'
+}
 current_branch() {
   local b; b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   [ -n "$b" ] && [ "$b" != "HEAD" ] && printf '%s' "$b"
 }
 
-port_in_use() { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
-
-# Path of the worktree on <branch> (empty if none). Arg2: repo dir (default main_root).
+# Worktree path on <branch> (empty if none).
 wt_for_branch() {
   local target="$1" repo="${2:-$(main_root)}" path
   while IFS= read -r line; do
@@ -90,6 +86,37 @@ wt_for_branch() {
   return 1
 }
 
+# Worktree path matching <name> (exact dir-name, else first substring). Empty if none.
+resolve_worktree() {
+  local q="$1" root; root="$(main_root)" || return 1
+  git -C "$root" worktree list --porcelain | awk -v q="$q" '
+    /^worktree /{ p=substr($0,10); b=p; sub(/.*\//,"",b);
+      if (b==q){ print p; exit }
+      if (cand=="" && index(b,q)){ cand=p } }
+    END{ if (cand!="") print cand }'
+}
+
+# herdr agent targets as: status<TAB>cwd  (empty if herdr/jq absent or no server).
+agent_map() {
+  have herdr && have jq || return 0
+  herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[]? | [(.agent_status // .status // "unknown"), (.cwd // .foreground_cwd // "")] | @tsv' 2>/dev/null || true
+}
+# Recent sessions as: recency<TAB>cwd  (empty if sessiongrep absent).
+session_rows() {
+  have sessiongrep || return 0
+  sessiongrep list --limit "${VIBE_HISTORY_SCAN:-500}" 2>/dev/null | awk '
+    /^[[:space:]]+cwd=/ { if (havep){ c=$0; sub(/.*cwd=/,"",c); sub(/[[:space:]]+preview=.*/,"",c); print rtime "\t" c } havep=0; next }
+    /^[^[:space:]]/ { rtime=$0; sub(/  .*/,"",rtime); havep=1 }'
+}
+state_glyph() {
+  case "$1" in
+    working) printf '● working' ;; blocked) printf '◍ blocked' ;;
+    done) printf '✓ done' ;; idle) printf '· idle' ;;
+    "") printf '–' ;; *) printf '? %s' "$1" ;;
+  esac
+}
+
 # Open the configured/auto-detected dev shell in <dir>; export VIBE_BASE=<base>.
 open_in() {
   local dir="$1" base="$2" cmd
@@ -97,15 +124,35 @@ open_in() {
   export VIBE_BASE="$base"
   cmd="$(cfg vibe.shell VIBE_SHELL_CMD "")"
   if [ -n "$cmd" ]; then
-    echo "Entering $dir (run 'exit' to return)..."
-    exec "${SHELL:-bash}" -c "$cmd"
-  elif [ -f "$dir/flake.nix" ] && command -v nix >/dev/null 2>&1; then
-    echo "Entering $dir nix dev shell (run 'exit' to return)..."
-    exec nix develop --command "${SHELL:-bash}"
+    echo "Entering $dir (run 'exit' to return)..."; exec "${SHELL:-bash}" -c "$cmd"
+  elif [ -f "$dir/flake.nix" ] && have nix; then
+    echo "Entering $dir nix dev shell (run 'exit' to return)..."; exec nix develop --command "${SHELL:-bash}"
   else
-    echo "Entering $dir (run 'exit' to return)..."
-    exec "${SHELL:-bash}" -i
+    echo "Entering $dir (run 'exit' to return)..."; exec "${SHELL:-bash}" -i
   fi
+}
+
+# Create a worktree+branch for <name> off [base]; run vibe_setup. Sets NEW_PATH/
+# NEW_BRANCH/NEW_BASE in the CURRENT shell (so vibe_setup's exports survive).
+NEW_PATH=""; NEW_BRANCH=""; NEW_BASE=""
+create_worktree() {
+  local name="$1" base="${2:-}"
+  if [ -z "$base" ]; then base="$(current_branch)"; [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"; fi
+  local root rem prefix slug branch wtdir path start
+  root="$(main_root)" || die "not inside a git repo"
+  rem="$(remote)"; prefix="$(cfg vibe.prefix VIBE_PREFIX wt)"; slug="$(slugify "$name")"
+  branch="${prefix}/${base//\//-}/${name}"
+  wtdir="$(worktrees_dir)"; path="${wtdir}/${slug}"
+  [ -e "$path" ] && die "path already exists: $path"
+  mkdir -p "$wtdir"
+  echo "Fetching ${rem}/${base}..." >&2
+  git -C "$root" fetch "$rem" "$base" >/dev/null 2>&1 || true
+  start="${rem}/${base}"; git -C "$root" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="$base"
+  echo "Creating worktree $path on $branch (from $start)..." >&2
+  git -C "$root" worktree add -b "$branch" "$path" "$start" >&2
+  git -C "$root" config "branch.${branch}.vibeBase" "$base"
+  run_hook vibe_setup "$path" "$base" "$branch" "$name" >&2 || true
+  NEW_PATH="$path"; NEW_BRANCH="$branch"; NEW_BASE="$base"
 }
 
 # ---- commands --------------------------------------------------------------
@@ -114,87 +161,123 @@ cmd_new() {
   local name="" base="" do_cd="true"
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --from) base="${2:?--from needs a branch}"; shift 2 ;;
-      --from=*) base="${1#*=}"; shift ;;
+      --from) base="${2:?--from needs a branch}"; shift 2 ;; --from=*) base="${1#*=}"; shift ;;
       --no-cd) do_cd="false"; shift ;;
       -*) die "unknown option for new: $1" ;;
       *) [ -z "$name" ] && name="$1" || die "unexpected arg: $1"; shift ;;
     esac
   done
   [ -n "$name" ] || die "usage: ${PROG} new <name> [--from <base>] [--no-cd]"
-
-  if [ -z "$base" ]; then base="$(current_branch)"; [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"; fi
-
-  local root rem prefix slug branch wtdir path
-  root="$(main_root)" || die "not inside a git repo"
-  rem="$(remote)"; prefix="$(cfg vibe.prefix VIBE_PREFIX wt)"
-  slug="$(slugify "$name")"
-  # Namespaced branch records its origin; git can't nest under an existing branch, so the
-  # prefix avoids the <base>/<name> directory/file ref conflict. Base slashes flattened.
-  branch="${prefix}/${base//\//-}/${name}"
-  wtdir="$(worktrees_dir)"; path="${wtdir}/${slug}"
-  [ -e "$path" ] && die "path already exists: $path"
-
-  mkdir -p "$wtdir"
-  echo "Fetching ${rem}/${base}..."
-  git -C "$root" fetch "$rem" "$base" >/dev/null 2>&1 || true
-  local start="${rem}/${base}"
-  git -C "$root" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="$base"
-
-  echo "Creating worktree $path on $branch (from $start)..."
-  git -C "$root" worktree add -b "$branch" "$path" "$start"
-  git -C "$root" config "branch.${branch}.vibeBase" "$base"
-
-  # Project hook: set up the worktree (env, ports, .env files, …). Runs even with --no-cd.
-  run_hook vibe_setup "$path" "$base" "$branch" "$name"
-
+  create_worktree "$name" "$base"
   cat <<EOF
 
-Worktree ready: $path
-  Branch: $branch  (base: $base)
+Worktree ready: $NEW_PATH
+  Branch: $NEW_BRANCH  (base: $NEW_BASE)
 EOF
-  if [ "$do_cd" = "true" ] && [ -t 1 ]; then open_in "$path" "$base"; fi
+  [ "$do_cd" = "true" ] && [ -t 1 ] && open_in "$NEW_PATH" "$NEW_BASE"
 }
 
+# code "<prompt>" [--name x] [--from base] [--agent cmd] : worktree + an agent on the prompt
+cmd_code() {
+  local prompt="" name="" from="" agent=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:?}"; shift 2 ;; --name=*) name="${1#*=}"; shift ;;
+      --from) from="${2:?}"; shift 2 ;; --from=*) from="${1#*=}"; shift ;;
+      --agent) agent="${2:?}"; shift 2 ;; --agent=*) agent="${1#*=}"; shift ;;
+      -*) die "unknown option for code: $1" ;;
+      *) [ -z "$prompt" ] && prompt="$1" || die "unexpected arg: $1"; shift ;;
+    esac
+  done
+  [ -n "$prompt" ] || die "usage: ${PROG} code \"<prompt>\" [--name x] [--from base] [--agent cmd]"
+  have herdr || die "herdr not found — needed to run agents (https://herdr.dev)"
+  [ -z "$name" ] && name="$(slug_from_prompt "$prompt")"
+  agent="${agent:-$(cfg vibe.agent VIBE_AGENT claude)}"
+  create_worktree "$name" "$from"
+  echo "Starting agent: ${agent} \"${prompt}\""
+  herdr agent start "$name" --cwd "$NEW_PATH" --no-focus -- ${agent} "$prompt" >/dev/null 2>&1 \
+    || die "herdr agent start failed — is the server running? ('herdr status')"
+  cat <<EOF
+
+Vibe '$name' is running (branch $NEW_BRANCH).
+  attach:  ${PROG} attach $name
+  board:   ${PROG} ls
+  finish:  ${PROG} finish $name
+EOF
+}
+
+# The board: worktrees × agent state × PR × session history.
 cmd_ls() {
-  local root rem; root="$(main_root)" || die "not inside a git repo"; rem="$(remote)"
-  printf '%-30s %-40s %s\n' "WORKTREE" "BRANCH" "PR"
-  local path branch pr
+  local root; root="$(main_root)" || die "not inside a git repo"
+  local -a WP=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=()
+  local path="" branch=""
   while IFS= read -r line; do
     case "$line" in
       worktree\ *) path="${line#worktree }" ;;
       branch\ *)
         branch="${line#branch refs/heads/}"
-        pr="-"
-        command -v gh >/dev/null 2>&1 && pr="$(gh pr list --head "$branch" --state all --json number,state -q '.[0] | if . == null then "-" else "#\(.number) \(.state)" end' 2>/dev/null || echo '-')"
-        [ -z "$pr" ] && pr="-"
-        printf '%-30s %-40s %s\n' "$(basename "$path")" "$branch" "$pr"
+        WP+=("$path"); WB+=("$branch"); WN+=("$(basename "$path")")
+        WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=("")
         ;;
     esac
   done < <(git -C "$root" worktree list --porcelain)
+
+  _wt_index() { # arg: lowercased cwd with trailing slash → longest-matching worktree index or -1
+    local clc="$1" i best=-1 bestlen=0
+    for i in "${!WL[@]}"; do
+      case "$clc" in "${WL[$i]}"/*) if [ "${#WL[$i]}" -gt "$bestlen" ]; then bestlen="${#WL[$i]}"; best="$i"; fi ;; esac
+    done
+    printf '%s' "$best"
+  }
+  local lc idx st cwd t c
+  while IFS=$'\t' read -r st cwd; do
+    [ -n "$cwd" ] || continue
+    lc="$(printf '%s' "$cwd" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
+    [ "$idx" -ge 0 ] && [ -z "${WSTATE[$idx]}" ] && WSTATE[$idx]="$st"
+  done < <(agent_map)
+  while IFS=$'\t' read -r t c; do
+    [ -n "$c" ] || continue
+    lc="$(printf '%s' "$c" | tr 'A-Z' 'a-z')/"; idx="$(_wt_index "$lc")"
+    if [ "$idx" -ge 0 ]; then WCNT[$idx]=$(( WCNT[idx] + 1 )); [ -z "${WFIRST[$idx]}" ] && WFIRST[$idx]="$t"; fi
+  done < <(session_rows)
+
+  printf '%-28s %-34s %-12s %-12s %s\n' "VIBE" "BRANCH" "AGENT" "PR" "HISTORY"
+  local i pr hist
+  for i in "${!WP[@]}"; do
+    pr="-"
+    if have gh; then
+      pr="$(gh pr list --head "${WB[$i]}" --state all --json number,state -q '.[0] | if .==null then "-" else "#\(.number) \(.state)" end' 2>/dev/null || echo '-')"
+      [ -z "$pr" ] && pr="-"
+    fi
+    if [ "${WCNT[$i]}" -gt 0 ]; then hist="${WCNT[$i]} · ${WFIRST[$i]}"; else hist="–"; fi
+    printf '%-28s %-34s %-12s %-12s %s\n' "${WN[$i]}" "${WB[$i]}" "$(state_glyph "${WSTATE[$i]}")" "$pr" "$hist"
+  done
 }
 
 cmd_cd() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} cd <name|branch>"
   local root path; root="$(main_root)" || die "not inside a git repo"
-  path="$(wt_for_branch "$name" "$root" || true)"
-  [ -z "$path" ] && [ -d "$(worktrees_dir)/$name" ] && path="$(worktrees_dir)/$name"
-  if [ -z "$path" ]; then
-    # substring fallback over dir name + branch
-    local hits=() p="" b=""
-    while IFS= read -r line; do
-      case "$line" in
-        worktree\ *) p="${line#worktree }"; [ "$(basename "$p")" = "$name" ] && hits=("$p") ;;
-        branch\ *) b="${line#branch refs/heads/}"; case "$(basename "$p"):$b" in *"$name"*) [ ${#hits[@]} -eq 0 ] && hits+=("$p") || { [ "${hits[0]}" = "$p" ] || hits+=("$p"); } ;; esac ;;
-      esac
-    done < <(git -C "$root" worktree list --porcelain)
-    [ ${#hits[@]} -eq 1 ] && path="${hits[0]}"
-    [ ${#hits[@]} -gt 1 ] && { echo "ambiguous '$name':" >&2; printf '  %s\n' "${hits[@]##*/}" >&2; return 1; }
-  fi
+  path="$(resolve_worktree "$name")"
   [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
   local branch base; branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
-  if [ -t 1 ]; then run_hook vibe_setup "$path" "$base" "$branch"; open_in "$path" "$base"; else printf '%s\n' "$path"; fi
+  if [ -t 1 ]; then run_hook vibe_setup "$path" "$base" "$branch" >/dev/null 2>&1 || true; open_in "$path" "$base"; else printf '%s\n' "$path"; fi
+}
+
+cmd_attach() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} attach <name>"
+  have herdr || die "herdr not found"
+  exec herdr agent attach "$name"
+}
+
+cmd_recall() {
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "usage: ${PROG} recall <name|branch> [sessiongrep args]"
+  have sessiongrep || die "sessiongrep not found"
+  local path; path="$(resolve_worktree "$name")"
+  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
+  echo "Sessions under $path:"
+  sessiongrep list --path "$path" "$@"
 }
 
 cmd_pull() {
@@ -202,7 +285,6 @@ cmd_pull() {
   local cur ref root rem; root="$(main_root)"; rem="$(remote)"
   cur="$(current_branch)" || die "detached HEAD — checkout a branch first"
   [ -n "$(git status --porcelain)" ] && die "uncommitted changes — commit or stash first"
-  # resolve ref: branch/commit-ish, else worktree dir name, else <remote>/<arg>
   if git rev-parse --verify --quiet "${arg}^{commit}" >/dev/null 2>&1; then ref="$arg"
   elif [ -n "$(wt_for_branch "$arg" "$root" 2>/dev/null)" ]; then ref="$(git -C "$(wt_for_branch "$arg" "$root")" rev-parse --abbrev-ref HEAD)"
   elif git rev-parse --verify --quiet "${rem}/${arg}^{commit}" >/dev/null 2>&1; then ref="${rem}/${arg}"
@@ -216,28 +298,34 @@ cmd_pull() {
   fi
 }
 
+# finish [<name>] [--no-merge] [--base b] [--force] : finish a worktree (by name, or the
+# current one): close its agent pane, PR + squash-merge, remove it, fast-forward the base.
 cmd_finish() {
-  local do_merge="true" force="false" base=""
+  local do_merge="true" force="false" base="" target=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --no-merge) do_merge="false" ;; --force) force="true" ;;
       --base) base="${2:?--base needs a branch}"; shift ;; --base=*) base="${1#*=}" ;;
-      *) die "unknown option for finish: $1" ;;
+      -*) die "unknown option for finish: $1" ;;
+      *) [ -z "$target" ] && target="$1" || die "unexpected arg: $1" ;;
     esac; shift
   done
-  local root rem branch here; root="$(main_root)"; rem="$(remote)"
-  here="$(pwd -P)"; branch="$(current_branch)" || die "detached HEAD — checkout the feature branch first"
+  local root rem here branch; root="$(main_root)"; rem="$(remote)"
+  if [ -n "$target" ]; then here="$(resolve_worktree "$target")"; [ -n "$here" ] || die "no worktree matching '$target'"; else here="$(pwd -P)"; fi
+  here="$(cd "$here" && pwd -P)"
+  branch="$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$branch" ] && [ "$branch" != HEAD ] || die "detached HEAD in $here"
   [ "$here" = "$root" ] && die "refusing to finish the primary checkout"
   case "$branch" in main|master) die "refusing to finish '$branch'" ;; esac
-  [ -n "$(git status --porcelain)" ] && [ "$force" != "true" ] && die "uncommitted/untracked changes — commit, or pass --force"
+  [ -n "$(git -C "$here" status --porcelain)" ] && [ "$force" != "true" ] && die "uncommitted/untracked changes in $here — commit, or pass --force"
   [ -z "$base" ] && base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
   [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"
 
   echo "Finishing $branch into $base."
-  echo "Pushing $branch..."; git push -u "$rem" "$branch"
+  echo "Pushing $branch..."; git -C "$here" push -u "$rem" "$branch"
 
   if [ "$do_merge" = "true" ]; then
-    command -v gh >/dev/null 2>&1 || die "gh not found — merge manually then re-run with --no-merge"
+    have gh || die "gh not found — merge manually then re-run with --no-merge"
     local pr; pr="$(gh pr list --head "$branch" --state open --json number -q '.[0].number' 2>/dev/null || true)"
     if [ -z "$pr" ]; then
       echo "Creating PR for $branch against $base..."
@@ -247,14 +335,20 @@ cmd_finish() {
     [ -n "$pr" ] || die "could not find/create an open PR for $branch"
     local m="UNKNOWN" n=0
     while [ "$n" -lt 10 ]; do m="$(gh pr view "$pr" --json mergeable -q .mergeable 2>/dev/null || echo UNKNOWN)"; [ "$m" != UNKNOWN ] && break; sleep 2; n=$((n+1)); done
-    [ "$m" = CONFLICTING ] && die "PR #$pr conflicts with $base — '${PROG} pull $base', resolve, push, retry"
+    [ "$m" = CONFLICTING ] && die "PR #$pr conflicts with $base — '${PROG} pull $base' in the worktree, resolve, push, retry"
     echo "Merging PR #$pr (squash)..."
     gh pr merge "$pr" --squash
     git -C "$root" push "$rem" --delete "$branch" >/dev/null 2>&1 || true
   fi
 
-  # Project hook: tear down the worktree's resources (stop services, etc.) before removal.
-  run_hook vibe_teardown "$here" "$base" "$branch"
+  # Close the agent's herdr workspace (if any) for this worktree.
+  if have herdr && have jq; then
+    local ws
+    ws="$(herdr agent list 2>/dev/null | jq -r --arg p "$here" '.result.agents[]? | select(((.cwd // "")|ascii_downcase)==($p|ascii_downcase) or (((.cwd // "")|ascii_downcase)|startswith(($p|ascii_downcase)+"/"))) | .workspace_id' | head -1)"
+    [ -n "$ws" ] && { echo "Closing herdr workspace $ws..."; herdr workspace close "$ws" >/dev/null 2>&1 || true; }
+  fi
+
+  run_hook vibe_teardown "$here" "$base" "$branch" || true
 
   cd "$root"
   local rmflag=""; [ "$force" = "true" ] && rmflag="--force"
@@ -262,59 +356,59 @@ cmd_finish() {
   git -C "$root" worktree remove $rmflag "$here"
   git -C "$root" branch -D "$branch" >/dev/null 2>&1 || true
 
-  # Reconcile the local base: fast-forward whatever worktree has it checked out.
   local base_wt=""
   if [ "$do_merge" = "true" ]; then
     git -C "$root" fetch "$rem" "$base" >/dev/null 2>&1 || true
     base_wt="$(wt_for_branch "$base" "$root" || true)"
     if [ -n "$base_wt" ]; then
-      if git -C "$base_wt" merge --ff-only "${rem}/${base}" >/dev/null 2>&1; then
-        echo "Fast-forwarded $base in $base_wt."
+      if git -C "$base_wt" merge --ff-only "${rem}/${base}" >/dev/null 2>&1; then echo "Fast-forwarded $base in $base_wt."
       else echo "Note: couldn't auto-update $base in $base_wt — pull it manually." >&2; fi
     else git -C "$root" fetch "$rem" "${base}:${base}" >/dev/null 2>&1 && echo "Updated local $base." || true; fi
   fi
   echo
-  if [ "$do_merge" = "true" ]; then
-    echo "Done. '$branch' merged into $base; worktree removed and $base updated locally."
-  else
-    echo "Done. '$branch' pushed; worktree removed (not merged — --no-merge)."
-  fi
-  echo "Return to the base checkout:  cd \"${base_wt:-$root}\""
+  if [ "$do_merge" = "true" ]; then echo "Done. '$branch' merged into $base; worktree removed and $base updated locally."
+  else echo "Done. '$branch' pushed; worktree removed (not merged — --no-merge)."; fi
+  echo "Base checkout: ${base_wt:-$root}"
 }
 
 usage() {
   cat <<EOF
-${PROG} — parallel feature worktrees for any git repo
+${PROG} — parallel feature worktrees (with optional agent orchestration) for any git repo
 
 Usage: ${PROG} <command> [args]
 
-  new <name> [--from <base>] [--no-cd]   Create a worktree + branch <prefix>/<base>/<name>
-                                         off the current branch (or --from), open a shell
-  ls                                     List worktrees with their branch + PR state
-  cd <name|branch>                       Open a shell in a worktree (exact or substring)
-  pull <branch|worktree>                 Merge another feature into the current branch
-  finish [--no-merge] [--base <b>] [--force]
-                                         Create PR if needed, conflict-check, squash-merge,
-                                         remove the worktree, fast-forward the base locally
+  new <name> [--from b] [--no-cd]   Create a worktree + branch wt/<base>/<name>, open a shell
+  code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
+                                    (opts: --name x, --from b, --agent cmd)
+  ls            (alias: board)      The board: worktrees × agent state × PR × session history
+  cd <name>                         Open a shell in a worktree (exact or substring match)
+  attach <name>                     Jump into the agent's pane (herdr)
+  recall <name> [args]              Session history scoped to a worktree (sessiongrep)
+  pull <ref>                        Merge another feature into the current branch
+  finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
+                                    worktree, fast-forward the base (opts: --no-merge,
+                                    --base b, --force). No <name> = the current worktree.
 
-Config (git config, or env): vibe.dir/VIBE_DIR, vibe.prefix/VIBE_PREFIX,
-  vibe.shell/VIBE_SHELL_CMD (command run in a worktree; default: nix flake → nix develop,
-  else \$SHELL), vibe.remote/VIBE_REMOTE.
+Core (new/ls/cd/pull/finish) needs only git (+ gh for finish). The agent layer
+(code/attach/recall and the live ls columns) uses herdr / sessiongrep / jq when present.
 
-Per-project: a committed .vibe.sh at the repo root is sourced — set VIBE_* defaults and
-  define hooks vibe_setup (after new / on cd; \$VIBE_WORKTREE \$VIBE_BASE \$VIBE_BRANCH set,
-  exports flow into the opened shell) and vibe_teardown (before finish removes a worktree).
+Config (git config or env): vibe.dir/VIBE_DIR, vibe.prefix/VIBE_PREFIX,
+  vibe.shell/VIBE_SHELL_CMD, vibe.remote/VIBE_REMOTE, vibe.agent/VIBE_AGENT (default claude),
+  VIBE_HISTORY_SCAN. Per-project .vibe.sh (sourced) can set these + hooks vibe_setup/vibe_teardown.
 EOF
 }
 
 main() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
-  load_project_config   # source repo-root .vibe.sh (VIBE_* defaults + hooks), if any
+  load_project_config
   local sub="${1:-}"; shift || true
   case "$sub" in
     new) cmd_new "$@" ;;
-    ls|list) cmd_ls "$@" ;;
+    code) cmd_code "$@" ;;
+    ls|list|board) cmd_ls "$@" ;;
     cd) cmd_cd "$@" ;;
+    attach) cmd_attach "$@" ;;
+    recall) cmd_recall "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;
     ""|-h|--help|help) usage ;;
