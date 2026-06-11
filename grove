@@ -248,7 +248,12 @@ cmd_finish() {
       else echo "Note: couldn't auto-update $base in $base_wt — pull it manually." >&2; fi
     else git -C "$root" fetch "$rem" "${base}:${base}" >/dev/null 2>&1 && echo "Updated local $base." || true; fi
   fi
-  echo; echo "Done. '$branch' merged into $base; worktree removed and $base updated locally."
+  echo
+  if [ "$do_merge" = "true" ]; then
+    echo "Done. '$branch' merged into $base; worktree removed and $base updated locally."
+  else
+    echo "Done. '$branch' pushed; worktree removed (not merged — --no-merge)."
+  fi
   echo "Return to the base checkout:  cd \"${base_wt:-$root}\""
 }
 
