@@ -96,8 +96,8 @@ vibe_teardown() {
 }
 ```
 
-This is exactly how a project like archhub layers its per-worktree ports / Docker project /
-`.env.local` / browser-tab label on top of the generic lifecycle — without forking `vibe`.
+This is how a project layers its per-worktree ports / Docker compose project / `.env`
+generation on top of the generic lifecycle — without forking `vibe`.
 (`.vibe.sh` is sourced, i.e. executed; only commit ones you trust — it's your own repo.)
 
 ## Requirements
