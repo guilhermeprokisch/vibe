@@ -200,9 +200,9 @@ cmd_code() {
   cat <<EOF
 
 Vibe '$name' is running (branch $NEW_BRANCH).
-  attach:  ${PROG} attach $name
-  board:   ${PROG} ls
-  finish:  ${PROG} finish $name
+  go to it: ${PROG} cd $name        (attaches to the agent)
+  board:    ${PROG} ls
+  finish:   ${PROG} finish $name
 EOF
 }
 
@@ -254,20 +254,42 @@ cmd_ls() {
   done
 }
 
-cmd_cd() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} cd <name|branch>"
-  local root path; root="$(main_root)" || die "not inside a git repo"
-  path="$(resolve_worktree "$name")"
-  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
-  local branch base; branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
-  if [ -t 1 ]; then run_hook vibe_setup "$path" "$base" "$branch" >/dev/null 2>&1 || true; open_in "$path" "$base"; else printf '%s\n' "$path"; fi
+# herdr agent NAME running in <worktree-path> (empty if none / herdr absent).
+agent_for_path() {
+  have herdr && have jq || return 0
+  herdr agent list 2>/dev/null | jq -r --arg p "$1" '
+    .result.agents[]? | select(((.cwd // "")|ascii_downcase)==($p|ascii_downcase)
+      or (((.cwd // "")|ascii_downcase)|startswith(($p|ascii_downcase)+"/"))) | .name' 2>/dev/null | head -1
 }
 
-cmd_attach() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} attach <name>"
-  have herdr || die "herdr not found"
-  exec herdr agent attach "$name"
+# Open a dev shell in <path> (or print the path when not a TTY, for `cd "$(…)"`).
+_open_worktree() {
+  local path="$1" root branch base
+  root="$(main_root)"
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
+  if [ -t 1 ]; then run_hook vibe_setup "$path" "$base" "$branch" >/dev/null 2>&1 || true; open_in "$path" "$base"
+  else printf '%s\n' "$path"; fi
+}
+
+# cd: go to the vibe — attach to its agent if one is running, else open a dev shell.
+cmd_cd() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} cd <name|branch>"
+  local path; path="$(resolve_worktree "$name")"
+  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
+  if [ -t 1 ]; then
+    local agent; agent="$(agent_for_path "$path")"
+    if [ -n "$agent" ]; then echo "Attaching to agent '$agent' (detach to leave)..."; exec herdr agent attach "$agent"; fi
+  fi
+  _open_worktree "$path"
+}
+
+# shell: always open a plain dev shell in the worktree (ignore any running agent).
+cmd_shell() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} shell <name|branch>"
+  local path; path="$(resolve_worktree "$name")"
+  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
+  _open_worktree "$path"
 }
 
 cmd_recall() {
@@ -381,8 +403,8 @@ Usage: ${PROG} <command> [args]
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
   ls            (alias: board)      The board: worktrees × agent state × PR × session history
-  cd <name>                         Open a shell in a worktree (exact or substring match)
-  attach <name>                     Jump into the agent's pane (herdr)
+  cd <name>     (alias: attach)     Go to the vibe: attach to its agent, else a dev shell
+  shell <name>                      Open a plain dev shell in a worktree (ignore its agent)
   recall <name> [args]              Session history scoped to a worktree (sessiongrep)
   pull <ref>                        Merge another feature into the current branch
   finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
@@ -406,8 +428,8 @@ main() {
     new) cmd_new "$@" ;;
     code) cmd_code "$@" ;;
     ls|list|board) cmd_ls "$@" ;;
-    cd) cmd_cd "$@" ;;
-    attach) cmd_attach "$@" ;;
+    cd|attach) cmd_cd "$@" ;;
+    shell) cmd_shell "$@" ;;
     recall) cmd_recall "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;
