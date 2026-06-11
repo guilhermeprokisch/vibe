@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# grove — parallel feature worktrees for any git project.
+#
+# A grove is your collection of git worktrees: spin up an isolated workspace per
+# feature (branch namespaced by the base it forked from), hack on it, then finish it
+# (PR + conflict-check + squash-merge) and clean up — fast-forwarding the base locally
+# so nothing needs a manual pull.
+#
+# Generic over any git repo. Uses `gh` for PR create/merge (only in `finish`).
+# No assumptions about ports, Docker, or Nix — the dev shell auto-detects a flake.
+#
+# Config (git config keys, overridable by env):
+#   grove.dir     / GROVE_DIR        worktrees parent dir (default ../<repo>-wt)
+#   grove.prefix  / GROVE_PREFIX     branch namespace      (default "wt")
+#   grove.shell   / GROVE_SHELL_CMD  command to open in a worktree (default: auto)
+#   grove.remote  / GROVE_REMOTE     remote name           (default "origin")
+set -euo pipefail
+
+PROG="$(basename "$0")"
+
+# ---- helpers ---------------------------------------------------------------
+
+die() { echo "${PROG}: $*" >&2; exit 1; }
+
+cfg() { # cfg <git-config-key> <env-var> <default>
+  local v
+  v="$(git config "$1" 2>/dev/null || true)"
+  [ -z "$v" ] && v="$(printenv "$2" 2>/dev/null || true)"
+  [ -z "$v" ] && v="$3"
+  printf '%s' "$v"
+}
+
+remote() { cfg grove.remote GROVE_REMOTE origin; }
+
+# Absolute path of the repo's main working tree (parent of the shared .git dir).
+main_root() {
+  local g
+  g="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$g" in /*) : ;; *) g="$(pwd)/$g" ;; esac
+  (cd "$(dirname "$g")" && pwd -P)
+}
+
+repo_name() { basename "$(main_root)"; }
+
+worktrees_dir() {
+  local d; d="$(cfg grove.dir GROVE_DIR "")"
+  if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s/%s-wt' "$(dirname "$(main_root)")" "$(repo_name)"; fi
+}
+
+slugify() {
+  local s; s="$(basename "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
+  [ -z "$s" ] && s="wt"; printf '%s' "$s"
+}
+
+current_branch() {
+  local b; b="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ -n "$b" ] && [ "$b" != "HEAD" ] && printf '%s' "$b"
+}
+
+port_in_use() { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+# Path of the worktree on <branch> (empty if none). Arg2: repo dir (default main_root).
+wt_for_branch() {
+  local target="$1" repo="${2:-$(main_root)}" path
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) path="${line#worktree }" ;;
+      branch\ *) [ "${line#branch refs/heads/}" = "$target" ] && { printf '%s' "$path"; return 0; } ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain)
+  return 1
+}
+
+# Open the configured/auto-detected dev shell in <dir>; export GROVE_BASE=<base>.
+open_in() {
+  local dir="$1" base="$2" cmd
+  cd "$dir" || die "cannot cd $dir"
+  export GROVE_BASE="$base"
+  cmd="$(cfg grove.shell GROVE_SHELL_CMD "")"
+  if [ -n "$cmd" ]; then
+    echo "Entering $dir (run 'exit' to return)..."
+    exec "${SHELL:-bash}" -c "$cmd"
+  elif [ -f "$dir/flake.nix" ] && command -v nix >/dev/null 2>&1; then
+    echo "Entering $dir nix dev shell (run 'exit' to return)..."
+    exec nix develop --command "${SHELL:-bash}"
+  else
+    echo "Entering $dir (run 'exit' to return)..."
+    exec "${SHELL:-bash}" -i
+  fi
+}
+
+# ---- commands --------------------------------------------------------------
+
+cmd_new() {
+  local name="" base="" do_cd="true"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --from) base="${2:?--from needs a branch}"; shift 2 ;;
+      --from=*) base="${1#*=}"; shift ;;
+      --no-cd) do_cd="false"; shift ;;
+      -*) die "unknown option for new: $1" ;;
+      *) [ -z "$name" ] && name="$1" || die "unexpected arg: $1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: ${PROG} new <name> [--from <base>] [--no-cd]"
+
+  if [ -z "$base" ]; then base="$(current_branch)"; [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"; fi
+
+  local root rem prefix slug branch wtdir path
+  root="$(main_root)" || die "not inside a git repo"
+  rem="$(remote)"; prefix="$(cfg grove.prefix GROVE_PREFIX wt)"
+  slug="$(slugify "$name")"
+  # Namespaced branch records its origin; git can't nest under an existing branch, so the
+  # prefix avoids the <base>/<name> directory/file ref conflict. Base slashes flattened.
+  branch="${prefix}/${base//\//-}/${name}"
+  wtdir="$(worktrees_dir)"; path="${wtdir}/${slug}"
+  [ -e "$path" ] && die "path already exists: $path"
+
+  mkdir -p "$wtdir"
+  echo "Fetching ${rem}/${base}..."
+  git -C "$root" fetch "$rem" "$base" >/dev/null 2>&1 || true
+  local start="${rem}/${base}"
+  git -C "$root" rev-parse --verify --quiet "$start" >/dev/null 2>&1 || start="$base"
+
+  echo "Creating worktree $path on $branch (from $start)..."
+  git -C "$root" worktree add -b "$branch" "$path" "$start"
+  git -C "$root" config "branch.${branch}.groveBase" "$base"
+
+  cat <<EOF
+
+Worktree ready: $path
+  Branch: $branch  (base: $base)
+EOF
+  if [ "$do_cd" = "true" ] && [ -t 1 ]; then open_in "$path" "$base"; fi
+}
+
+cmd_ls() {
+  local root rem; root="$(main_root)" || die "not inside a git repo"; rem="$(remote)"
+  printf '%-30s %-40s %s\n' "WORKTREE" "BRANCH" "PR"
+  local path branch pr
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) path="${line#worktree }" ;;
+      branch\ *)
+        branch="${line#branch refs/heads/}"
+        pr="-"
+        command -v gh >/dev/null 2>&1 && pr="$(gh pr list --head "$branch" --state all --json number,state -q '.[0] | "#\(.number) \(.state)"' 2>/dev/null || echo '-')"
+        [ -z "$pr" ] && pr="-"
+        printf '%-30s %-40s %s\n' "$(basename "$path")" "$branch" "$pr"
+        ;;
+    esac
+  done < <(git -C "$root" worktree list --porcelain)
+}
+
+cmd_cd() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: ${PROG} cd <name|branch>"
+  local root path; root="$(main_root)" || die "not inside a git repo"
+  path="$(wt_for_branch "$name" "$root" || true)"
+  [ -z "$path" ] && [ -d "$(worktrees_dir)/$name" ] && path="$(worktrees_dir)/$name"
+  if [ -z "$path" ]; then
+    # substring fallback over dir name + branch
+    local hits=() p="" b=""
+    while IFS= read -r line; do
+      case "$line" in
+        worktree\ *) p="${line#worktree }"; [ "$(basename "$p")" = "$name" ] && hits=("$p") ;;
+        branch\ *) b="${line#branch refs/heads/}"; case "$(basename "$p"):$b" in *"$name"*) [ ${#hits[@]} -eq 0 ] && hits+=("$p") || { [ "${hits[0]}" = "$p" ] || hits+=("$p"); } ;; esac ;;
+      esac
+    done < <(git -C "$root" worktree list --porcelain)
+    [ ${#hits[@]} -eq 1 ] && path="${hits[0]}"
+    [ ${#hits[@]} -gt 1 ] && { echo "ambiguous '$name':" >&2; printf '  %s\n' "${hits[@]##*/}" >&2; return 1; }
+  fi
+  [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
+  local branch base; branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  base="$(git -C "$root" config "branch.${branch}.groveBase" 2>/dev/null || true)"
+  if [ -t 1 ]; then open_in "$path" "$base"; else printf '%s\n' "$path"; fi
+}
+
+cmd_pull() {
+  local arg="${1:-}"; [ -n "$arg" ] || die "usage: ${PROG} pull <branch|worktree>"
+  local cur ref root rem; root="$(main_root)"; rem="$(remote)"
+  cur="$(current_branch)" || die "detached HEAD — checkout a branch first"
+  [ -n "$(git status --porcelain)" ] && die "uncommitted changes — commit or stash first"
+  # resolve ref: branch/commit-ish, else worktree dir name, else <remote>/<arg>
+  if git rev-parse --verify --quiet "${arg}^{commit}" >/dev/null 2>&1; then ref="$arg"
+  elif [ -n "$(wt_for_branch "$arg" "$root" 2>/dev/null)" ]; then ref="$(git -C "$(wt_for_branch "$arg" "$root")" rev-parse --abbrev-ref HEAD)"
+  elif git rev-parse --verify --quiet "${rem}/${arg}^{commit}" >/dev/null 2>&1; then ref="${rem}/${arg}"
+  else die "could not resolve '$arg'"; fi
+  [ "$ref" = "$cur" ] && die "'$ref' is the current branch"
+  echo "Fetching ${rem}..."; git fetch "$rem" >/dev/null 2>&1 || true
+  echo "Merging $ref into $cur..."
+  if git merge --no-edit "$ref"; then echo "Merged $ref cleanly."; else
+    echo "" >&2; echo "Conflicts in:" >&2; git diff --name-only --diff-filter=U | sed 's/^/  /' >&2
+    echo >&2; echo "Resolve then 'git add … && git commit', or 'git merge --abort'." >&2; return 1
+  fi
+}
+
+cmd_finish() {
+  local do_merge="true" force="false" base=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-merge) do_merge="false" ;; --force) force="true" ;;
+      --base) base="${2:?--base needs a branch}"; shift ;; --base=*) base="${1#*=}" ;;
+      *) die "unknown option for finish: $1" ;;
+    esac; shift
+  done
+  local root rem branch here; root="$(main_root)"; rem="$(remote)"
+  here="$(pwd -P)"; branch="$(current_branch)" || die "detached HEAD — checkout the feature branch first"
+  [ "$here" = "$root" ] && die "refusing to finish the primary checkout"
+  case "$branch" in main|master) die "refusing to finish '$branch'" ;; esac
+  [ -n "$(git status --porcelain)" ] && [ "$force" != "true" ] && die "uncommitted/untracked changes — commit, or pass --force"
+  [ -z "$base" ] && base="$(git -C "$root" config "branch.${branch}.groveBase" 2>/dev/null || true)"
+  [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"
+
+  echo "Finishing $branch into $base."
+  echo "Pushing $branch..."; git push -u "$rem" "$branch"
+
+  if [ "$do_merge" = "true" ]; then
+    command -v gh >/dev/null 2>&1 || die "gh not found — merge manually then re-run with --no-merge"
+    local pr; pr="$(gh pr list --head "$branch" --state open --json number -q '.[0].number' 2>/dev/null || true)"
+    if [ -z "$pr" ]; then
+      echo "Creating PR for $branch against $base..."
+      gh pr create --base "$base" --head "$branch" --fill
+      pr="$(gh pr list --head "$branch" --state open --json number -q '.[0].number' 2>/dev/null || true)"
+    fi
+    [ -n "$pr" ] || die "could not find/create an open PR for $branch"
+    local m="UNKNOWN" n=0
+    while [ "$n" -lt 10 ]; do m="$(gh pr view "$pr" --json mergeable -q .mergeable 2>/dev/null || echo UNKNOWN)"; [ "$m" != UNKNOWN ] && break; sleep 2; n=$((n+1)); done
+    [ "$m" = CONFLICTING ] && die "PR #$pr conflicts with $base — '${PROG} pull $base', resolve, push, retry"
+    echo "Merging PR #$pr (squash)..."
+    gh pr merge "$pr" --squash
+    git -C "$root" push "$rem" --delete "$branch" >/dev/null 2>&1 || true
+  fi
+
+  cd "$root"
+  local rmflag=""; [ "$force" = "true" ] && rmflag="--force"
+  echo "Removing worktree $here..."
+  git -C "$root" worktree remove $rmflag "$here"
+  git -C "$root" branch -D "$branch" >/dev/null 2>&1 || true
+
+  # Reconcile the local base: fast-forward whatever worktree has it checked out.
+  local base_wt=""
+  if [ "$do_merge" = "true" ]; then
+    git -C "$root" fetch "$rem" "$base" >/dev/null 2>&1 || true
+    base_wt="$(wt_for_branch "$base" "$root" || true)"
+    if [ -n "$base_wt" ]; then
+      if git -C "$base_wt" merge --ff-only "${rem}/${base}" >/dev/null 2>&1; then
+        echo "Fast-forwarded $base in $base_wt."
+      else echo "Note: couldn't auto-update $base in $base_wt — pull it manually." >&2; fi
+    else git -C "$root" fetch "$rem" "${base}:${base}" >/dev/null 2>&1 && echo "Updated local $base." || true; fi
+  fi
+  echo; echo "Done. '$branch' merged into $base; worktree removed and $base updated locally."
+  echo "Return to the base checkout:  cd \"${base_wt:-$root}\""
+}
+
+usage() {
+  cat <<EOF
+${PROG} — parallel feature worktrees for any git repo
+
+Usage: ${PROG} <command> [args]
+
+  new <name> [--from <base>] [--no-cd]   Create a worktree + branch <prefix>/<base>/<name>
+                                         off the current branch (or --from), open a shell
+  ls                                     List worktrees with their branch + PR state
+  cd <name|branch>                       Open a shell in a worktree (exact or substring)
+  pull <branch|worktree>                 Merge another feature into the current branch
+  finish [--no-merge] [--base <b>] [--force]
+                                         Create PR if needed, conflict-check, squash-merge,
+                                         remove the worktree, fast-forward the base locally
+
+Config (git config, or env): grove.dir/GROVE_DIR, grove.prefix/GROVE_PREFIX,
+  grove.shell/GROVE_SHELL_CMD (command run in a worktree; default: nix flake → nix develop,
+  else \$SHELL), grove.remote/GROVE_REMOTE.
+EOF
+}
+
+main() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    new) cmd_new "$@" ;;
+    ls|list) cmd_ls "$@" ;;
+    cd) cmd_cd "$@" ;;
+    pull) cmd_pull "$@" ;;
+    finish) cmd_finish "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "${PROG}: unknown command: $sub" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
