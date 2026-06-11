@@ -144,7 +144,7 @@ cmd_ls() {
       branch\ *)
         branch="${line#branch refs/heads/}"
         pr="-"
-        command -v gh >/dev/null 2>&1 && pr="$(gh pr list --head "$branch" --state all --json number,state -q '.[0] | "#\(.number) \(.state)"' 2>/dev/null || echo '-')"
+        command -v gh >/dev/null 2>&1 && pr="$(gh pr list --head "$branch" --state all --json number,state -q '.[0] | if . == null then "-" else "#\(.number) \(.state)" end' 2>/dev/null || echo '-')"
         [ -z "$pr" ] && pr="-"
         printf '%-30s %-40s %s\n' "$(basename "$path")" "$branch" "$pr"
         ;;
