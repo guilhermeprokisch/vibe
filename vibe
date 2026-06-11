@@ -230,7 +230,7 @@ Vibe '$name' is running (branch $NEW_BRANCH).
 EOF
 }
 
-# The board: worktrees × agent state × PR × session history.
+# The board: worktrees × agent model × state × session history.
 cmd_ls() {
   local root; root="$(main_root)" || die "not inside a git repo"
   local -a WP=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
@@ -269,21 +269,16 @@ cmd_ls() {
     fi
   done < <(session_rows)
 
-  printf '%-26s %-30s %-9s %-11s %-11s %s\n' "VIBE" "BRANCH" "MODEL" "STATE" "PR" "HISTORY"
-  local i pr hist model
+  printf '%-30s %-10s %-12s %s\n' "VIBE" "MODEL" "STATE" "HISTORY"
+  local i hist model
   for i in "${!WP[@]}"; do
-    pr="-"
-    if have gh; then
-      pr="$(gh pr list --head "${WB[$i]}" --state all --json number,state -q '.[0] | if .==null then "-" else "#\(.number) \(.state)" end' 2>/dev/null || echo '-')"
-      [ -z "$pr" ] && pr="-"
-    fi
     # MODEL: the agent recorded at code-time (basename), else the most-recent session provider.
     model="$(git -C "$root" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
     model="$(basename "${model%% *}" 2>/dev/null)"
     [ -z "$model" ] && model="${WPROV[$i]}"
     [ -z "$model" ] && model="–"
     if [ "${WCNT[$i]}" -gt 0 ]; then hist="${WCNT[$i]} · ${WFIRST[$i]}"; else hist="–"; fi
-    printf '%-26s %-30s %-9s %-11s %-11s %s\n' "${WN[$i]}" "${WB[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$pr" "$hist"
+    printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
   done
 }
 
@@ -445,7 +440,7 @@ Usage: ${PROG} <command> [args]
   new <name> [--from b] [--no-cd]   Create a worktree + branch vibe/<base>/<name>, open a shell
   code "<prompt>" [opts]            Create a worktree and start an agent on the prompt
                                     (opts: --name x, --from b, --agent cmd)
-  ls            (alias: board)      The board: worktrees × model × agent state × PR × history
+  ls            (alias: board)      The board: each vibe with its agent model, state, history
   chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
   shell <name>  (alias: cd)         Open a plain dev shell in a worktree
   pull <ref>                        Merge another feature into the current branch

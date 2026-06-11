@@ -38,22 +38,24 @@ vibe finish --no-merge / --base b / --force
 # agent layer (needs herdr)
 vibe code "add WhatsApp opt-out"   # worktree + start an agent on the prompt
    [--name x] [--from b] [--agent cmd]
-vibe ls            (alias: board)  # worktrees × model × live agent state × PR × history
+vibe ls            (alias: board)  # each vibe with its agent model, live state, history
 vibe chat feature-a  (alias: attach) # attach to the agent, or resume it if stopped
 ```
 
 ### The board
 
 ```
-VIBE                BRANCH               AGENT      PR          HISTORY
-auth-fix            vibe/main/auth-fix   ● working  –           2 · 18m ago
-export-pdf          vibe/main/export-pdf ◍ blocked  #41 open    1 · 3h ago
-billing             vibe/main/billing    ✓ done     #39 open    4
+VIBE                MODEL    STATE      HISTORY
+auth-fix            claude   ● working  2 · 18m ago
+export-pdf          codex    ◍ blocked  1 · 3h ago
+billing             claude   ✓ done     4
 ```
 
-`AGENT` ← herdr `agent_status` (matched to a worktree by cwd) · `PR` ← gh ·
+`MODEL` ← the agent recorded by `code` (else most-recent sessiongrep provider) ·
+`STATE` ← herdr `agent_status` (matched to a worktree by cwd) ·
 `HISTORY` ← sessiongrep (one scan, bucketed to the longest matching worktree path,
-case-insensitive). Each column degrades to `–` if its tool/server isn't available.
+case-insensitive). Each degrades to `–` if its tool/server isn't available. No `gh`
+calls — the board stays fast.
 
 ### How it works
 
