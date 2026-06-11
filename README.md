@@ -41,6 +41,8 @@ vibe code "add WhatsApp opt-out"   # worktree + start an agent on the prompt
 vibe ls            (alias: board)  # each vibe with its agent model, live state, history
 vibe ls --all                      # every project (PROJECT column): registry + live agents
 vibe ls --watch [-n 2]             # live dashboard, redraws every N seconds (Ctrl-C to stop)
+                                   #   state (herdr) refreshes every tick; worktrees/history
+                                   #   every VIBE_WATCH_FULL seconds (default 10)
 vibe chat feature-a  (alias: attach) # attach to the agent, or resume it if stopped
 ```
 

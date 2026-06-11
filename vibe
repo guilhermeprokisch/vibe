@@ -252,7 +252,7 @@ EOF
 # The board: each vibe with its agent model, state, session history.
 # `--all` (-a) spans every project (registry + herdr-active repos), with a PROJECT column.
 cmd_ls() {
-  local all="false" watch="false" interval="2"
+  local all="false" watch="false" interval="2" slow_every="${VIBE_WATCH_FULL:-10}"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --all|-a) all="true" ;;
@@ -263,84 +263,96 @@ cmd_ls() {
     esac; shift
   done
 
-  _board() {
-  local -a WR=() WB=() WN=() WL=() WCNT=() WFIRST=() WSTATE=() WPROV=()
-
-  _collect() { # _collect <repo>: append that repo's worktrees to the arrays
-    local repo="$1" path="" branch=""
-    while IFS= read -r line; do
-      case "$line" in
-        worktree\ *) path="${line#worktree }" ;;
-        branch\ *)
-          branch="${line#branch refs/heads/}"
-          WR+=("$repo"); WB+=("$branch"); WN+=("$(basename "$path")")
-          WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WSTATE+=(""); WPROV+=("")
-          ;;
-      esac
-    done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
-  }
-  if [ "$all" = "true" ]; then
-    local r; while IFS= read -r r; do _collect "$r"; done < <(all_repos)
-  else
-    _collect "$(main_root)" || die "not inside a git repo"
-  fi
-
-  # Longest-matching worktree index for a (already-lowercased, slash-suffixed) cwd → RIDX.
-  # Sets a variable instead of echoing, to avoid a subshell fork per row.
+  # Persist across watch ticks: WR/WB/WN/WL + precomputed WMODEL/WHIST (slow), WSTATE (fast).
+  local -a WR WB WN WL WMODEL WHIST WSTATE
   local RIDX
-  _wt_index() {
+  _wt_index() {  # longest worktree-path prefix of <lowercased cwd + '/'> → RIDX (no fork)
     local clc="$1" i bestlen=0; RIDX=-1
     for i in "${!WL[@]}"; do
       case "$clc" in "${WL[$i]}"/*) if [ "${#WL[$i]}" -gt "$bestlen" ]; then bestlen="${#WL[$i]}"; RIDX="$i"; fi ;; esac
     done
   }
-  # cwds from agent_map / session_rows are already lowercased (jq/awk), so no per-row fork.
-  local st cwd t prov c
-  while IFS=$'\t' read -r st cwd; do
-    [ -n "$cwd" ] || continue
-    _wt_index "${cwd}/"
-    [ "$RIDX" -ge 0 ] && [ -z "${WSTATE[$RIDX]}" ] && WSTATE[$RIDX]="$st"
-  done < <(agent_map)
-  while IFS=$'\t' read -r t prov c; do
-    [ -n "$c" ] || continue
-    _wt_index "${c}/"
-    if [ "$RIDX" -ge 0 ]; then
-      WCNT[$RIDX]=$(( WCNT[RIDX] + 1 ))
-      [ -z "${WFIRST[$RIDX]}" ] && WFIRST[$RIDX]="$t"
-      [ -z "${WPROV[$RIDX]}" ] && WPROV[$RIDX]="$prov"
-    fi
-  done < <(session_rows)
 
-  local i hist model
-  if [ "$all" = "true" ]; then printf '%-20s %-26s %-10s %-12s %s\n' "PROJECT" "VIBE" "MODEL" "STATE" "HISTORY"
-  else printf '%-30s %-10s %-12s %s\n' "VIBE" "MODEL" "STATE" "HISTORY"; fi
-  for i in "${!WR[@]}"; do
-    # MODEL: agent recorded at code-time (in that repo's config), else session provider.
-    model="$(git -C "${WR[$i]}" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
-    model="$(basename "${model%% *}" 2>/dev/null)"
-    [ -z "$model" ] && model="${WPROV[$i]}"
-    [ -z "$model" ] && model="–"
-    if [ "${WCNT[$i]}" -gt 0 ]; then hist="${WCNT[$i]} · ${WFIRST[$i]}"; else hist="–"; fi
-    if [ "$all" = "true" ]; then
-      printf '%-20s %-26s %-10s %-12s %s\n' "$(basename "${WR[$i]}")" "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
-    else
-      printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "$model" "$(state_glyph "${WSTATE[$i]}")" "$hist"
-    fi
-  done
-  }  # end _board
+  # SLOW: worktrees + per-row MODEL + HISTORY (git + sessiongrep). Recomputed occasionally.
+  _refresh_slow() {
+    WR=(); WB=(); WN=(); WL=(); WMODEL=(); WHIST=(); WSTATE=()
+    local -a WCNT=() WFIRST=() WPROV=()
+    _collect() {
+      local repo="$1" path="" branch=""
+      while IFS= read -r line; do
+        case "$line" in
+          worktree\ *) path="${line#worktree }" ;;
+          branch\ *)
+            branch="${line#branch refs/heads/}"
+            WR+=("$repo"); WB+=("$branch"); WN+=("$(basename "$path")")
+            WL+=("$(printf '%s' "$path" | tr 'A-Z' 'a-z')"); WCNT+=(0); WFIRST+=(""); WPROV+=(""); WSTATE+=("")
+            ;;
+        esac
+      done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+    }
+    if [ "$all" = "true" ]; then local r; while IFS= read -r r; do _collect "$r"; done < <(all_repos)
+    else _collect "$(main_root)" || die "not inside a git repo"; fi
+    local t prov c
+    while IFS=$'\t' read -r t prov c; do
+      [ -n "$c" ] || continue
+      _wt_index "${c}/"
+      if [ "$RIDX" -ge 0 ]; then
+        WCNT[$RIDX]=$(( WCNT[RIDX] + 1 ))
+        [ -z "${WFIRST[$RIDX]}" ] && WFIRST[$RIDX]="$t"
+        [ -z "${WPROV[$RIDX]}" ] && WPROV[$RIDX]="$prov"
+      fi
+    done < <(session_rows)
+    local i model
+    for i in "${!WR[@]}"; do
+      model="$(git -C "${WR[$i]}" config "branch.${WB[$i]}.vibeAgent" 2>/dev/null || true)"
+      model="$(basename "${model%% *}" 2>/dev/null)"
+      [ -z "$model" ] && model="${WPROV[$i]}"
+      [ -z "$model" ] && model="–"
+      WMODEL[$i]="$model"
+      if [ "${WCNT[$i]}" -gt 0 ]; then WHIST[$i]="${WCNT[$i]} · ${WFIRST[$i]}"; else WHIST[$i]="–"; fi
+    done
+  }
+
+  # FAST: just the live agent state from herdr (≈instant) — re-run every watch tick.
+  _refresh_state() {
+    local i; for i in "${!WR[@]}"; do WSTATE[$i]=""; done
+    local st cwd
+    while IFS=$'\t' read -r st cwd; do
+      [ -n "$cwd" ] || continue
+      _wt_index "${cwd}/"
+      [ "$RIDX" -ge 0 ] && [ -z "${WSTATE[$RIDX]}" ] && WSTATE[$RIDX]="$st"
+    done < <(agent_map)
+  }
+
+  _render() {
+    local i
+    if [ "$all" = "true" ]; then printf '%-20s %-26s %-10s %-12s %s\n' "PROJECT" "VIBE" "MODEL" "STATE" "HISTORY"
+    else printf '%-30s %-10s %-12s %s\n' "VIBE" "MODEL" "STATE" "HISTORY"; fi
+    for i in "${!WR[@]}"; do
+      if [ "$all" = "true" ]; then
+        printf '%-20s %-26s %-10s %-12s %s\n' "$(basename "${WR[$i]}")" "${WN[$i]}" "${WMODEL[$i]}" "$(state_glyph "${WSTATE[$i]}")" "${WHIST[$i]}"
+      else
+        printf '%-30s %-10s %-12s %s\n' "${WN[$i]}" "${WMODEL[$i]}" "$(state_glyph "${WSTATE[$i]}")" "${WHIST[$i]}"
+      fi
+    done
+  }
 
   if [ "$watch" = "true" ]; then
     have tput && tput civis 2>/dev/null || true
     trap 'have tput && tput cnorm 2>/dev/null; echo; exit 0' INT TERM
+    local firstrun=1 last=0 now
     while :; do
+      now=$SECONDS
+      if [ "$firstrun" = 1 ] || [ $(( now - last )) -ge "$slow_every" ]; then _refresh_slow; last=$now; firstrun=0; fi
+      _refresh_state
       printf '\033[H\033[2J'
-      printf 'vibe board — %s  (every %ss · Ctrl-C to stop)\n\n' "$(date +%H:%M:%S)" "$interval"
-      _board
+      printf 'vibe board — %s  (state every %ss · full every %ss · Ctrl-C to stop)\n\n' "$(date +%H:%M:%S)" "$interval" "$slow_every"
+      _render
       sleep "$interval" || break
     done
     have tput && tput cnorm 2>/dev/null || true
   else
-    _board
+    _refresh_slow; _refresh_state; _render
   fi
 }
 
