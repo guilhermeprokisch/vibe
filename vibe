@@ -431,6 +431,47 @@ cmd_finish() {
   echo "Base checkout: ${base_wt:-$root}"
 }
 
+# rm [<name>] [--force] [--keep-branch] : remove a vibe (worktree + branch) WITHOUT finishing.
+cmd_rm() {
+  local force="false" keepbranch="false" target=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force) force="true" ;; --keep-branch) keepbranch="true" ;;
+      -*) die "unknown option for rm: $1" ;;
+      *) [ -z "$target" ] && target="$1" || die "unexpected arg: $1" ;;
+    esac; shift
+  done
+  local root here branch; root="$(main_root)" || die "not inside a git repo"
+  if [ -n "$target" ]; then here="$(resolve_worktree "$target")"; [ -n "$here" ] || die "no worktree matching '$target' (see: ${PROG} ls)"; else here="$(pwd -P)"; fi
+  here="$(cd "$here" && pwd -P)"
+  branch="$(git -C "$here" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ "$here" = "$root" ] && die "refusing to remove the primary checkout"
+  case "$branch" in main|master) die "refusing to remove '$branch'" ;; esac
+  [ -n "$(git -C "$here" status --porcelain)" ] && [ "$force" != "true" ] && die "uncommitted/untracked changes in $here — commit, or pass --force to discard"
+
+  # Close the agent's pane + run the project teardown hook before removal.
+  if have herdr && have jq; then
+    local ws
+    ws="$(herdr agent list 2>/dev/null | jq -r --arg p "$here" '.result.agents[]? | select(((.cwd // "")|ascii_downcase)==($p|ascii_downcase) or (((.cwd // "")|ascii_downcase)|startswith(($p|ascii_downcase)+"/"))) | .workspace_id' | head -1)"
+    [ -n "$ws" ] && { echo "Closing herdr workspace $ws..."; herdr workspace close "$ws" >/dev/null 2>&1 || true; }
+  fi
+  run_hook vibe_teardown "$here" "" "$branch" || true
+
+  cd "$root"
+  local rmflag=""; [ "$force" = "true" ] && rmflag="--force"
+  echo "Removing worktree $here..."
+  git -C "$root" worktree remove $rmflag "$here"
+
+  if [ "$keepbranch" = "true" ]; then
+    echo "Kept branch '$branch'."
+  elif [ -n "$branch" ] && [ "$branch" != HEAD ]; then
+    if git -C "$root" branch -d "$branch" 2>/dev/null; then echo "Deleted branch '$branch'."
+    elif [ "$force" = "true" ]; then git -C "$root" branch -D "$branch" >/dev/null 2>&1 && echo "Force-deleted branch '$branch'."
+    else echo "Kept branch '$branch' — it has unmerged commits. Re-run with --force to delete it (or it stays safe in git)."; fi
+  fi
+  echo "Done. Removed vibe '$(basename "$here")'."
+}
+
 usage() {
   cat <<EOF
 ${PROG} — parallel feature worktrees (with optional agent orchestration) for any git repo
@@ -447,6 +488,9 @@ Usage: ${PROG} <command> [args]
   finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
                                     worktree, fast-forward the base (opts: --no-merge,
                                     --base b, --force). No <name> = the current worktree.
+  rm [<name>] [--force] [--keep-branch]
+                                    Remove a vibe (worktree + branch) WITHOUT finishing.
+                                    Refuses to discard uncommitted/unmerged work unless --force.
 
 Core (new/ls/cd/pull/finish) needs only git (+ gh for finish). The agent layer
 (code/chat and the live ls columns) uses herdr / sessiongrep / jq when present.
@@ -469,6 +513,7 @@ main() {
     shell|cd) cmd_shell "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;
+    rm) cmd_rm "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "${PROG}: unknown command: $sub" >&2; usage; exit 1 ;;
   esac
