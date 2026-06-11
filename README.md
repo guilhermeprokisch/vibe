@@ -52,6 +52,8 @@ vibe finish --no-merge       # just stop + remove (no PR merge)
 
 ### Config
 
+Simple knobs via git config or env:
+
 | git config | env | default |
 |---|---|---|
 | `vibe.dir` | `VIBE_DIR` | `../<repo>-wt` |
@@ -59,11 +61,44 @@ vibe finish --no-merge       # just stop + remove (no PR merge)
 | `vibe.shell` | `VIBE_SHELL_CMD` | auto (nix flake → `nix develop`, else `$SHELL`) |
 | `vibe.remote` | `VIBE_REMOTE` | `origin` |
 
-Example — a project that uses `devenv`:
+```bash
+git config vibe.shell 'devenv shell'   # e.g. a devenv project
+```
+
+### Per-project setup: `.vibe.sh` + hooks
+
+For anything beyond static knobs (compute per-worktree ports, write `.env` files, spin
+services up/down), commit a **`.vibe.sh`** at the repo root. `vibe` sources it on every
+run, so it can set `VIBE_*` defaults and define two optional hook functions:
+
+- **`vibe_setup`** — runs after `new` creates a worktree and again on `cd` (before the
+  shell opens). It receives `$VIBE_WORKTREE`, `$VIBE_BASE`, `$VIBE_BRANCH`, `$VIBE_NAME`,
+  and anything it **`export`s flows into the shell** vibe then opens.
+- **`vibe_teardown`** — runs in `finish` just before the worktree is removed (stop
+  services, etc.), with the same variables.
 
 ```bash
-git config vibe.shell 'devenv shell'
+# .vibe.sh — per-worktree isolated dev instance (committed, shared with the team)
+VIBE_PREFIX=wt
+
+vibe_setup() {
+  # Deterministic port offset from the worktree name; write the app's local env.
+  local off=$(( $(printf '%s' "$VIBE_NAME" | cksum | cut -d' ' -f1) % 50 ))
+  export PORT=$(( 3000 + off )) COMPOSE_PROJECT_NAME="myapp-$VIBE_NAME"
+  cat > "$VIBE_WORKTREE/.env.local" <<EOF
+PORT=$PORT
+DATABASE_URL=postgres://localhost:$(( 5432 + off ))/myapp
+EOF
+}
+
+vibe_teardown() {
+  COMPOSE_PROJECT_NAME="myapp-$VIBE_NAME" docker compose down >/dev/null 2>&1 || true
+}
 ```
+
+This is exactly how a project like archhub layers its per-worktree ports / Docker project /
+`.env.local` / browser-tab label on top of the generic lifecycle — without forking `vibe`.
+(`.vibe.sh` is sourced, i.e. executed; only commit ones you trust — it's your own repo.)
 
 ## Requirements
 

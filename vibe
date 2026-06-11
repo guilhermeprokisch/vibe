@@ -22,12 +22,29 @@ PROG="$(basename "$0")"
 
 die() { echo "${PROG}: $*" >&2; exit 1; }
 
-cfg() { # cfg <git-config-key> <env-var> <default>
+cfg() { # cfg <git-config-key> <var-name> <default>
   local v
   v="$(git config "$1" 2>/dev/null || true)"
-  [ -z "$v" ] && v="$(printenv "$2" 2>/dev/null || true)"
+  # Fall back to the named variable (env, or set by a sourced .vibe.sh), then default.
+  [ -z "$v" ] && [ -n "${2:-}" ] && v="${!2-}"
   [ -z "$v" ] && v="$3"
   printf '%s' "$v"
+}
+
+# Source a committed per-project .vibe.sh (repo root) if present: it can set VIBE_*
+# defaults and define hook functions (vibe_setup / vibe_teardown).
+load_project_config() {
+  local f; f="$(main_root 2>/dev/null)/.vibe.sh"
+  [ -f "$f" ] && . "$f"
+  return 0
+}
+
+# Run a hook function (if defined) with VIBE_WORKTREE/VIBE_BASE/VIBE_BRANCH/VIBE_NAME
+# exported; anything the hook exports propagates into the shell vibe then opens.
+run_hook() { # run_hook <fn> <worktree> <base> <branch> [name]
+  declare -F "$1" >/dev/null 2>&1 || return 0
+  export VIBE_WORKTREE="$2" VIBE_BASE="$3" VIBE_BRANCH="$4" VIBE_NAME="${5:-$(basename "$2")}"
+  "$1"
 }
 
 remote() { cfg vibe.remote VIBE_REMOTE origin; }
@@ -126,6 +143,9 @@ cmd_new() {
   git -C "$root" worktree add -b "$branch" "$path" "$start"
   git -C "$root" config "branch.${branch}.vibeBase" "$base"
 
+  # Project hook: set up the worktree (env, ports, .env files, …). Runs even with --no-cd.
+  run_hook vibe_setup "$path" "$base" "$branch" "$name"
+
   cat <<EOF
 
 Worktree ready: $path
@@ -172,7 +192,7 @@ cmd_cd() {
   [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
   local branch base; branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
-  if [ -t 1 ]; then open_in "$path" "$base"; else printf '%s\n' "$path"; fi
+  if [ -t 1 ]; then run_hook vibe_setup "$path" "$base" "$branch"; open_in "$path" "$base"; else printf '%s\n' "$path"; fi
 }
 
 cmd_pull() {
@@ -231,6 +251,9 @@ cmd_finish() {
     git -C "$root" push "$rem" --delete "$branch" >/dev/null 2>&1 || true
   fi
 
+  # Project hook: tear down the worktree's resources (stop services, etc.) before removal.
+  run_hook vibe_teardown "$here" "$base" "$branch"
+
   cd "$root"
   local rmflag=""; [ "$force" = "true" ] && rmflag="--force"
   echo "Removing worktree $here..."
@@ -275,11 +298,16 @@ Usage: ${PROG} <command> [args]
 Config (git config, or env): vibe.dir/VIBE_DIR, vibe.prefix/VIBE_PREFIX,
   vibe.shell/VIBE_SHELL_CMD (command run in a worktree; default: nix flake → nix develop,
   else \$SHELL), vibe.remote/VIBE_REMOTE.
+
+Per-project: a committed .vibe.sh at the repo root is sourced — set VIBE_* defaults and
+  define hooks vibe_setup (after new / on cd; \$VIBE_WORKTREE \$VIBE_BASE \$VIBE_BRANCH set,
+  exports flow into the opened shell) and vibe_teardown (before finish removes a worktree).
 EOF
 }
 
 main() {
   git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+  load_project_config   # source repo-root .vibe.sh (VIBE_* defaults + hooks), if any
   local sub="${1:-}"; shift || true
   case "$sub" in
     new) cmd_new "$@" ;;
