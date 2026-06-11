@@ -52,7 +52,8 @@ run_hook() { # run_hook <fn> <worktree> <base> <branch> [name]
 remote() { cfg vibe.remote VIBE_REMOTE origin; }
 
 # Registry of repos vibe has touched (for `ls --all`). Auto-populated on every run.
-registry_file() { printf '%s/vibe/projects' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+state_dir() { printf '%s/vibe' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+registry_file() { printf '%s/projects' "$(state_dir)"; }
 register_project() {
   local root="${1:-}" f; [ -n "$root" ] || return 0; f="$(registry_file)"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
@@ -156,6 +157,24 @@ state_glyph() {
   esac
 }
 
+# Names of herdr agents currently blocked (global, ordered).
+blocked_agents() {
+  have herdr && have jq || return 0
+  herdr agent list 2>/dev/null | jq -r '.result.agents[]? | select((.agent_status // .status) == "blocked") | .name' 2>/dev/null
+}
+
+# Fire a desktop notification that <name> is blocked (configurable via vibe.notify / VIBE_NOTIFY;
+# the command sees $VIBE_BLOCKED_NAME). Falls back to osascript / notify-send, then a bell.
+notify_blocked() {
+  local name="$1" cmd
+  cmd="$(git config vibe.notify 2>/dev/null || printf '%s' "${VIBE_NOTIFY:-}")"
+  if [ -n "$cmd" ]; then VIBE_BLOCKED_NAME="$name" sh -c "$cmd" >/dev/null 2>&1 || true
+  elif have osascript; then osascript -e "display notification \"$name needs you\" with title \"vibe: blocked\"" >/dev/null 2>&1 || true
+  elif have notify-send; then notify-send "vibe: blocked" "$name needs you" >/dev/null 2>&1 || true
+  fi
+  printf '\a🔔 vibe '\''%s'\'' is blocked\n' "$name"
+}
+
 # Open the configured/auto-detected dev shell in <dir>; export VIBE_BASE=<base>.
 open_in() {
   local dir="$1" base="$2" cmd
@@ -252,11 +271,12 @@ EOF
 # The board: each vibe with its agent model, state, session history.
 # `--all` (-a) spans every project (registry + herdr-active repos), with a PROJECT column.
 cmd_ls() {
-  local all="false" watch="false" interval="2" slow_every="${VIBE_WATCH_FULL:-10}"
+  local all="false" watch="false" notify="false" interval="2" slow_every="${VIBE_WATCH_FULL:-10}"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --all|-a) all="true" ;;
       --watch|-w) watch="true" ;;
+      --notify) notify="true"; watch="true" ;;
       --interval|-n) interval="${2:?-n needs seconds}"; shift ;;
       --interval=*) interval="${1#*=}" ;;
       *) die "unknown option for ls: $1" ;;
@@ -340,11 +360,21 @@ cmd_ls() {
   if [ "$watch" = "true" ]; then
     have tput && tput civis 2>/dev/null || true
     trap 'have tput && tput cnorm 2>/dev/null; echo; exit 0' INT TERM
-    local firstrun=1 last=0 now
+    local firstrun=1 last=0 now prev_blocked=" " cur_blocked j
     while :; do
       now=$SECONDS
       if [ "$firstrun" = 1 ] || [ $(( now - last )) -ge "$slow_every" ]; then _refresh_slow; last=$now; firstrun=0; fi
       _refresh_state
+      if [ "$notify" = "true" ]; then
+        cur_blocked=" "
+        for j in "${!WR[@]}"; do
+          if [ "${WSTATE[$j]}" = "blocked" ]; then
+            case "$prev_blocked" in *" ${WN[$j]} "*) : ;; *) notify_blocked "${WN[$j]}" ;; esac
+            cur_blocked="${cur_blocked}${WN[$j]} "
+          fi
+        done
+        prev_blocked="$cur_blocked"
+      fi
       printf '\033[H\033[2J'
       printf 'vibe board — %s  (state every %ss · full every %ss · Ctrl-C to stop)\n\n' "$(date +%H:%M:%S)" "$interval" "$slow_every"
       _render
@@ -412,6 +442,45 @@ cmd_shell() {
   local path; path="$(resolve_worktree "$name")"
   [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
   _open_worktree "$path"
+}
+
+# next: attach to the next blocked vibe's agent (global, round-robins across all projects).
+cmd_next() {
+  have herdr || die "herdr not found"
+  local -a B=(); local n
+  while IFS= read -r n; do [ -n "$n" ] && B+=("$n"); done < <(blocked_agents)
+  [ "${#B[@]}" -eq 0 ] && { echo "No blocked vibes."; return 0; }
+  local sf; sf="$(state_dir)/last-next"
+  local last=""; [ -f "$sf" ] && last="$(cat "$sf" 2>/dev/null)"
+  local pick="${B[0]}" i
+  for i in "${!B[@]}"; do
+    if [ "${B[$i]}" = "$last" ]; then pick="${B[$(( (i + 1) % ${#B[@]} ))]}"; break; fi
+  done
+  mkdir -p "$(state_dir)" 2>/dev/null || true; printf '%s' "$pick" > "$sf"
+  echo "→ blocked vibe '$pick' (${#B[@]} blocked). Attaching..."
+  exec herdr agent attach "$pick"
+}
+
+# notify: background daemon that desktop-notifies whenever a vibe goes blocked.
+cmd_notify() {
+  have herdr || die "herdr not found"
+  local interval=3
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --interval|-n) interval="${2:?-n needs seconds}"; shift ;; --interval=*|-n=*) interval="${1#*=}" ;;
+      *) die "unknown option for notify: $1" ;; esac; shift
+  done
+  echo "vibe notify — watching for blocked agents every ${interval}s (Ctrl-C to stop)"
+  trap 'echo; exit 0' INT TERM
+  local prev=" " cur n
+  while :; do
+    cur=" "
+    while IFS= read -r n; do [ -n "$n" ] && cur="${cur}${n} "; done < <(blocked_agents)
+    for n in $cur; do
+      case "$prev" in *" $n "*) : ;; *) notify_blocked "$n" ;; esac
+    done
+    prev="$cur"
+    sleep "$interval" || break
+  done
 }
 
 cmd_pull() {
@@ -560,7 +629,10 @@ Usage: ${PROG} <command> [args]
                                     --all spans every project (PROJECT column) — registry of
                                     repos vibe has touched, plus any repo with a live agent.
                                     --watch redraws every S seconds (default 2) for live state.
+                                    --notify (implies --watch) desktop-alerts on newly blocked vibes.
   chat <name>   (alias: attach)     Talk to the vibe's agent: attach if running, else resume it
+  next                              Jump to the next blocked vibe's agent (round-robins, all projects)
+  notify [-n S]                     Daemon: desktop-notify whenever a vibe goes blocked (Ctrl-C to stop)
   shell <name>  (alias: cd)         Open a plain dev shell in a worktree
   pull <ref>                        Merge another feature into the current branch
   finish [<name>] [opts]            Close the agent pane, PR + squash-merge, remove the
@@ -589,6 +661,8 @@ main() {
     code) cmd_code "$@" ;;
     ls|list|board) cmd_ls "$@" ;;
     chat|attach) cmd_chat "$@" ;;
+    next) cmd_next "$@" ;;
+    notify) cmd_notify "$@" ;;
     shell|cd) cmd_shell "$@" ;;
     pull) cmd_pull "$@" ;;
     finish) cmd_finish "$@" ;;

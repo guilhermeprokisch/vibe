@@ -44,7 +44,15 @@ vibe ls --watch [-n 2]             # live dashboard, redraws every N seconds (Ct
                                    #   state (herdr) refreshes every tick; worktrees/history
                                    #   every VIBE_WATCH_FULL seconds (default 10)
 vibe chat feature-a  (alias: attach) # attach to the agent, or resume it if stopped
+vibe next                          # jump to the next BLOCKED vibe (round-robins, all projects)
+vibe notify [-n 3]                 # daemon: desktop-alert when any vibe goes blocked
+vibe ls --watch --notify           # live board that also alerts on newly blocked vibes
 ```
+
+Blocked-agent workflow: run `vibe notify &` (or in a herdr pane) and it pings you the moment
+any agent blocks; then `vibe next` tabs you straight into blocked agents one after another.
+The alert command is configurable via `vibe.notify` / `VIBE_NOTIFY` (sees `$VIBE_BLOCKED_NAME`),
+defaulting to `osascript` (macOS) / `notify-send` (Linux), plus a terminal bell.
 
 ### The board
 
