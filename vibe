@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# grove — parallel feature worktrees for any git project.
+# vibe — parallel feature worktrees for any git project.
 #
-# A grove is your collection of git worktrees: spin up an isolated workspace per
+# A vibe is your collection of git worktrees: spin up an isolated workspace per
 # feature (branch namespaced by the base it forked from), hack on it, then finish it
 # (PR + conflict-check + squash-merge) and clean up — fast-forwarding the base locally
 # so nothing needs a manual pull.
@@ -10,10 +10,10 @@
 # No assumptions about ports, Docker, or Nix — the dev shell auto-detects a flake.
 #
 # Config (git config keys, overridable by env):
-#   grove.dir     / GROVE_DIR        worktrees parent dir (default ../<repo>-wt)
-#   grove.prefix  / GROVE_PREFIX     branch namespace      (default "wt")
-#   grove.shell   / GROVE_SHELL_CMD  command to open in a worktree (default: auto)
-#   grove.remote  / GROVE_REMOTE     remote name           (default "origin")
+#   vibe.dir     / VIBE_DIR        worktrees parent dir (default ../<repo>-wt)
+#   vibe.prefix  / VIBE_PREFIX     branch namespace      (default "wt")
+#   vibe.shell   / VIBE_SHELL_CMD  command to open in a worktree (default: auto)
+#   vibe.remote  / VIBE_REMOTE     remote name           (default "origin")
 set -euo pipefail
 
 PROG="$(basename "$0")"
@@ -30,7 +30,7 @@ cfg() { # cfg <git-config-key> <env-var> <default>
   printf '%s' "$v"
 }
 
-remote() { cfg grove.remote GROVE_REMOTE origin; }
+remote() { cfg vibe.remote VIBE_REMOTE origin; }
 
 # Absolute path of the repo's main working tree (parent of the shared .git dir).
 main_root() {
@@ -43,7 +43,7 @@ main_root() {
 repo_name() { basename "$(main_root)"; }
 
 worktrees_dir() {
-  local d; d="$(cfg grove.dir GROVE_DIR "")"
+  local d; d="$(cfg vibe.dir VIBE_DIR "")"
   if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s/%s-wt' "$(dirname "$(main_root)")" "$(repo_name)"; fi
 }
 
@@ -71,12 +71,12 @@ wt_for_branch() {
   return 1
 }
 
-# Open the configured/auto-detected dev shell in <dir>; export GROVE_BASE=<base>.
+# Open the configured/auto-detected dev shell in <dir>; export VIBE_BASE=<base>.
 open_in() {
   local dir="$1" base="$2" cmd
   cd "$dir" || die "cannot cd $dir"
-  export GROVE_BASE="$base"
-  cmd="$(cfg grove.shell GROVE_SHELL_CMD "")"
+  export VIBE_BASE="$base"
+  cmd="$(cfg vibe.shell VIBE_SHELL_CMD "")"
   if [ -n "$cmd" ]; then
     echo "Entering $dir (run 'exit' to return)..."
     exec "${SHELL:-bash}" -c "$cmd"
@@ -108,7 +108,7 @@ cmd_new() {
 
   local root rem prefix slug branch wtdir path
   root="$(main_root)" || die "not inside a git repo"
-  rem="$(remote)"; prefix="$(cfg grove.prefix GROVE_PREFIX wt)"
+  rem="$(remote)"; prefix="$(cfg vibe.prefix VIBE_PREFIX wt)"
   slug="$(slugify "$name")"
   # Namespaced branch records its origin; git can't nest under an existing branch, so the
   # prefix avoids the <base>/<name> directory/file ref conflict. Base slashes flattened.
@@ -124,7 +124,7 @@ cmd_new() {
 
   echo "Creating worktree $path on $branch (from $start)..."
   git -C "$root" worktree add -b "$branch" "$path" "$start"
-  git -C "$root" config "branch.${branch}.groveBase" "$base"
+  git -C "$root" config "branch.${branch}.vibeBase" "$base"
 
   cat <<EOF
 
@@ -171,7 +171,7 @@ cmd_cd() {
   fi
   [ -n "$path" ] || die "no worktree matching '$name' (see: ${PROG} ls)"
   local branch base; branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  base="$(git -C "$root" config "branch.${branch}.groveBase" 2>/dev/null || true)"
+  base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
   if [ -t 1 ]; then open_in "$path" "$base"; else printf '%s\n' "$path"; fi
 }
 
@@ -208,7 +208,7 @@ cmd_finish() {
   [ "$here" = "$root" ] && die "refusing to finish the primary checkout"
   case "$branch" in main|master) die "refusing to finish '$branch'" ;; esac
   [ -n "$(git status --porcelain)" ] && [ "$force" != "true" ] && die "uncommitted/untracked changes — commit, or pass --force"
-  [ -z "$base" ] && base="$(git -C "$root" config "branch.${branch}.groveBase" 2>/dev/null || true)"
+  [ -z "$base" ] && base="$(git -C "$root" config "branch.${branch}.vibeBase" 2>/dev/null || true)"
   [ -z "$base" ] && base="$(cfg init.defaultBranch '' main)"
 
   echo "Finishing $branch into $base."
@@ -272,9 +272,9 @@ Usage: ${PROG} <command> [args]
                                          Create PR if needed, conflict-check, squash-merge,
                                          remove the worktree, fast-forward the base locally
 
-Config (git config, or env): grove.dir/GROVE_DIR, grove.prefix/GROVE_PREFIX,
-  grove.shell/GROVE_SHELL_CMD (command run in a worktree; default: nix flake → nix develop,
-  else \$SHELL), grove.remote/GROVE_REMOTE.
+Config (git config, or env): vibe.dir/VIBE_DIR, vibe.prefix/VIBE_PREFIX,
+  vibe.shell/VIBE_SHELL_CMD (command run in a worktree; default: nix flake → nix develop,
+  else \$SHELL), vibe.remote/VIBE_REMOTE.
 EOF
 }
 
