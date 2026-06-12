@@ -163,14 +163,21 @@ blocked_agents() {
   herdr agent list 2>/dev/null | jq -r '.result.agents[]? | select((.agent_status // .status) == "blocked") | .name' 2>/dev/null
 }
 
-# Fire a desktop notification that <name> is blocked (configurable via vibe.notify / VIBE_NOTIFY;
-# the command sees $VIBE_BLOCKED_NAME). Falls back to osascript / notify-send, then a bell.
+# Fire a desktop notification that <name> is blocked. Configurable via vibe.notify /
+# VIBE_NOTIFY (the command sees $VIBE_BLOCKED_NAME). Otherwise prefers terminal-notifier
+# (reliable native macOS notifications + sound), then osascript (native but silent/flaky),
+# then notify-send (Linux); always also rings the terminal bell.
 notify_blocked() {
   local name="$1" cmd
   cmd="$(git config vibe.notify 2>/dev/null || printf '%s' "${VIBE_NOTIFY:-}")"
-  if [ -n "$cmd" ]; then VIBE_BLOCKED_NAME="$name" sh -c "$cmd" >/dev/null 2>&1 || true
-  elif have osascript; then osascript -e "display notification \"$name needs you\" with title \"vibe: blocked\"" >/dev/null 2>&1 || true
-  elif have notify-send; then notify-send "vibe: blocked" "$name needs you" >/dev/null 2>&1 || true
+  if [ -n "$cmd" ]; then
+    VIBE_BLOCKED_NAME="$name" sh -c "$cmd" >/dev/null 2>&1 || true
+  elif have terminal-notifier; then
+    terminal-notifier -title "vibe: blocked" -message "$name needs you" -sound default -group vibe >/dev/null 2>&1 || true
+  elif have osascript; then
+    osascript -e "display notification \"$name needs you\" with title \"vibe: blocked\" sound name \"Glass\"" >/dev/null 2>&1 || true
+  elif have notify-send; then
+    notify-send "vibe: blocked" "$name needs you" >/dev/null 2>&1 || true
   fi
   printf '\a🔔 vibe '\''%s'\'' is blocked\n' "$name"
 }
