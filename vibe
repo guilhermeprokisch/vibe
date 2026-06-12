@@ -264,8 +264,7 @@ cmd_code() {
   # Record the agent so `chat` knows what to restore later.
   git -C "$(main_root)" config "branch.${NEW_BRANCH}.vibeAgent" "$agent" 2>/dev/null || true
   echo "Starting agent: ${agent} \"${prompt}\""
-  herdr agent start "$name" --cwd "$NEW_PATH" --no-focus -- ${agent} "$prompt" >/dev/null 2>&1 \
-    || die "herdr agent start failed — is the server running? ('herdr status')"
+  _herdr_agent_start "$name" "$NEW_PATH" ${agent} "$prompt"
   cat <<EOF
 
 Vibe '$name' is running (branch $NEW_BRANCH).
@@ -393,6 +392,22 @@ cmd_ls() {
   fi
 }
 
+# Start a herdr agent target, surfacing herdr's real error on failure.
+# _herdr_agent_start <name> <cwd> <argv...>
+_herdr_agent_start() {
+  local name="$1" cwd="$2"; shift 2
+  local out emsg
+  if out="$(herdr agent start "$name" --cwd "$cwd" --no-focus -- "$@" 2>&1)"; then return 0; fi
+  emsg="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null)"; emsg="${emsg:-$out}"
+  case "$emsg" in
+    *openpty*|*"out of pty"*|*pseudo*)
+      die "herdr couldn't allocate a terminal (${emsg}). The system is likely out of
+  pseudo-terminals — close some terminals/agents, restart the offending app, or raise the
+  limit:  sudo sysctl -w kern.tty.ptmx_max=2048   (check holders: lsof -n | grep -c /dev/ttys)" ;;
+    *) die "herdr agent start failed: ${emsg}  ('herdr status' to check the server)" ;;
+  esac
+}
+
 # herdr agent NAME running in <worktree-path> (empty if none / herdr absent).
 agent_for_path() {
   have herdr && have jq || return 0
@@ -437,8 +452,7 @@ cmd_chat() {
   resume="$(resume_cmd_for "$acmd")"
   echo "Restoring agent in $path: ${resume}"
   run_hook vibe_setup "$path" "$base" "$branch" >/dev/null 2>&1 || true
-  herdr agent start "$wtname" --cwd "$path" --no-focus -- ${resume} >/dev/null 2>&1 \
-    || die "herdr agent start failed — 'herdr status'?"
+  _herdr_agent_start "$wtname" "$path" ${resume}
   [ -t 1 ] || { echo "Restored agent '$wtname'."; return 0; }
   exec herdr agent attach "$wtname"
 }
